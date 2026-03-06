@@ -4,7 +4,7 @@ console.log('Starting...');
 
 const client = new DeliverooApi(
     'https://deliveroojs.onrender.com/',
-    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjE5YWJjNSIsIm5hbWUiOiJhbm9ueW1vdXMiLCJyb2xlIjoidXNlciIsImlhdCI6MTc3MjgwMjIzM30.eNrKiGs8A9on0cfXWgrXvQFTjlLB9DZ72wAlRZqgQuw'
+    'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjMwY2U5MCIsIm5hbWUiOiJhIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NzI4MTA5NzB9.Vj_GrNMXVDyP_U8a4ZkxJ2K1r77EHk0SShlwUJYg9m8'
 )
 
 async function myFn () {
@@ -77,4 +77,5 @@ client.onYou(async (me) => {
  * 
  * What if other agents are moving?
  * - Dealing with failing actions, by insisting on path.
+
  */
