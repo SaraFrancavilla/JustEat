@@ -1,5 +1,7 @@
-import { key, manhattan } from "../utils/math.js";
+import { key, manhattan, R } from "../utils/math.js";
 import { DIRS } from "../utils/directions.js";
+import { validGoal, isWalkable } from "../world/helpers.js";
+import { CFG } from "../config.js";
 
 
 class MinHeap {
