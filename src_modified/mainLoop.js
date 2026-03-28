@@ -6,7 +6,6 @@ import { samePos, sameTarget} from "./utils/directions.js";
 import { syncCaches, markVisited, intention, clearIntention } from "./world/state.js";
 import { blacklistGoal } from "./world/helpers.js";
 import {CFG, debug} from "./config.js";
-import {R} from "./utils/math.js";
 import { onlineSolver, PddlExecutor } from "@unitn-asa/pddl-client";
 
 

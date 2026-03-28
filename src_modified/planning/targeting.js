@@ -1,5 +1,5 @@
 import { W } from "../world/state.js";
-import { manhattan, key } from "../utils/math.js";
+import { manhattan, key, R } from "../utils/math.js";
 import{DIRS} from "../utils/directions.js";
 import {aStar} from "./astar.js";
 import { carriedParcels, isGoalBlacklisted, validGoal} from "../world/helpers.js";

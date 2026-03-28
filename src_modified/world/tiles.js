@@ -46,7 +46,7 @@ export function makeTile(x, y, delivery = false, guessed = false) {
 export function setTile(x, y, delivery = false, guessed = false) {
     const rx = R(x);
     const ry = R(y);
-    const k = key(rx, ry);
+    const k = key(rx, ry); // Use rounded coordinates as the key to ensure consistency in tile representation
     const prev = W.tiles.get(k);
 
     const isDelivery = !!delivery || !!prev?.delivery || W.learnedDelivery.has(k);
