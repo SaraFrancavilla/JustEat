@@ -11,8 +11,7 @@ CONFIG
 ============================================================ */
 
 const HOST = "https://deliveroojs.onrender.com/";
-const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjVmMTQxNCIsIm5hbWUiOiJ4Iiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NzMzMTA0MjZ9.8YzQoj3JJNmLbWx5EdeLDGpEhmPSHBigZx-cIhgwOyg";
-
+const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImI3NTlmYSIsIm5hbWUiOiJhbm9ueW1vdXMiLCJyb2xlIjoidXNlciIsImlhdCI6MTc3NDI3MzQ4N30.-NTMZ2MzUF9W9CcsKdah5pvqTCB23NZ9lAN0ortyvRc";
 const LOG_LEVEL = 2;
 
 const CFG = {
@@ -184,7 +183,6 @@ function setTile(x, y, delivery = false, guessed = false) {
     const prev = W.tiles.get(k);
 
     const isDelivery = !!delivery || !!prev?.delivery || W.learnedDelivery.has(k);
-
     W.tiles.set(k, {
         x: rx,
         y: ry,
@@ -882,7 +880,7 @@ MAIN LOOP
 let busy = false;
 
 async function tick() {
-    if (!W.me || busy) return;
+    if (!W.me || busy) return; 
     busy = true;
 
     try {
