@@ -1,1 +1,4 @@
-il file prova.js è il file iniziale che usiamo per testare il movimento del cosino nella mappa
+* Elimina seed local map e crea una mappa totale (matrice)
+* Funzione di aggiornamento tile scatola chiamata da onsensing...
+* no-pickup until non necessario per lista di priorità
+* marked-tile non necessaria per accumulare numero di passaggi
