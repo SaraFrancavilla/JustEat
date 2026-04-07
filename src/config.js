@@ -1,11 +1,11 @@
 export const HOST = "https://deliveroojs.onrender.com/";
-export const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImY3Y2NhZCIsIm5hbWUiOiJhbm9ueW1vdXMiLCJyb2xlIjoidXNlciIsImlhdCI6MTc3NDY5OTEzMX0.ZZm4Lx3TWhLoygvvQ8ygFmZOxK-l-jhDmWieHjDHUgA";
+export const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxODNiNSIsIm5hbWUiOiJibG9iIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NzUxNDEzODN9.w2BZ-KBgiWCd0C4D2EkqbfE6rw9dyvAqseU-BHu8pyE";
 
 export const LOG_LEVEL = 2;
 
 export const CFG = {
     TICK_RATE_MS: 100,
-    REPLAN_STEPS: 4,
+    REPLAN_STEPS: 10,
     ASTAR_MAX_EXPANSIONS: 4000,
     DELIVER_REWARD_THRESHOLD: 8,
     DELIVER_DIST_THRESHOLD: 4,
@@ -23,9 +23,9 @@ export function syncCaches() {
     }
 
     if (deliveryDirty) {
-        W.deliveryZones = [];
+        W.deliveryTiles = [];
         for (const t of W.tiles.values()) {
-            if (t.delivery) W.deliveryZones.push({ x: t.x, y: t.y });
+            if (t.delivery) W.deliveryTiles.push({ x: t.x, y: t.y });
         }
         deliveryDirty = false;
     }
