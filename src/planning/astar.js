@@ -1,5 +1,7 @@
-import { key, manhattan } from "../utils/math.js";
+import { key, manhattan, R } from "../utils/math.js";
 import { DIRS } from "../utils/directions.js";
+import { validGoal, canStep } from "../world/helpers.js";
+import { CFG } from "../config.js";
 
 
 class MinHeap {
@@ -88,7 +90,7 @@ export function aStar(sx, sy, gx, gy) {
             const ny = n.y + d.dy;
             const nk = key(nx, ny);
 
-            if (!isWalkable(nx, ny, goal)) continue;
+            if (!canStep(n.x, n.y, d.dir, nx, ny, goal)) continue;
 
             const ng = (gScore.get(n.k) ?? Infinity) + 1;
             if (ng < (gScore.get(nk) ?? Infinity)) {
