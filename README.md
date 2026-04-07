@@ -9,3 +9,6 @@
 * Più possibilità in base al numero di agenti
 * Planning per punteggio pacco e distanza agenti
 * Algoritmi greedy per A*
+
+## Idee nuove
+* fargli capire che volendo lui può spostare il crate per 'farsi strada', non deve solo considerarlo come ostacolo temporaneo ma deve sapere che può spostarlo se gli serve passare da quella parte
