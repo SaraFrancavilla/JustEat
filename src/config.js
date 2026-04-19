@@ -1,6 +1,6 @@
 export const HOST = "https://deliveroojs.onrender.com/";
-export const TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjgxODNiNSIsIm5hbWUiOiJibG9iIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3NzUxNDEzODN9.w2BZ-KBgiWCd0C4D2EkqbfE6rw9dyvAqseU-BHu8pyE";
-
+export const TOKEN = process.env.DELIVEROO_TOKEN?.trim();
+ 
 export const LOG_LEVEL = 2;
 
 export const CFG = {

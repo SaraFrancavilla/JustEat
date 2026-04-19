@@ -6,6 +6,9 @@ import { carriedParcels, isGoalBlacklisted, validGoal } from "../world/helpers.j
 import { inKnownBounds } from "../world/tiles.js";
 import { CFG } from "../config.js";
 
+//per permettere una consegna obbligata
+let forcedDeliveryTarget = null;
+
 export function nearestDeliveryFrom(x, y) {
   let best = null;
   let d = Infinity;
@@ -141,17 +144,44 @@ export function planPathToTarget(target) {
 /**
  * Decide what to do next: DELIVER, PICKUP, or EXPLORE (frontier or spawner band).
  */
+
 export function deliberate() {
   const carried = carriedParcels();
   const total = carried.reduce((s, p) => s + p.reward, 0);
   const dz = nearestDelivery();
 
+
+
+  if (!carried.length) {
+    forcedDeliveryTarget = null;
+  }
+
+  // Sticky deliver mode: once threshold is reached, keep delivering
+  // until all carried parcels are dropped.
+  if (carried.length && forcedDeliveryTarget) {
+    const lockedValid =
+      validGoal(forcedDeliveryTarget) && !isGoalBlacklisted(forcedDeliveryTarget);
+
+    if (lockedValid) {
+      return { type: "DELIVER", target: forcedDeliveryTarget };
+    }
+
+    if (dz && !isGoalBlacklisted(dz)) {
+      forcedDeliveryTarget = { x: dz.x, y: dz.y };
+      return { type: "DELIVER", target: forcedDeliveryTarget };
+    }
+
+    forcedDeliveryTarget = null;
+  }
+
+
   // Only consider DELIVER when actually carrying something
   if (carried.length && dz && !isGoalBlacklisted(dz)) {
     const d = manhattan(W.me.x, W.me.y, dz.x, dz.y);
 
-    // If we are basically on the delivery tile, deliver
-    if (d <= 1) {
+    // If we are basically on the delivery tile or if we have many parcels, deliver
+    //MIGLIORA PARAMETRI
+    if (d <= 1 || total >= 80) {
       return { type: "DELIVER", target: dz };
     }
 

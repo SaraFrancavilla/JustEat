@@ -4,16 +4,16 @@
   "name": "project",
   "version": "1.0.0",
   "description": "",
-  "main": "src_modified/index.js",
+  "main": "src/index.js",
   "type": "module",
   "scripts": {
-    "start": "node src_modified/index.js",
+    "start": "(explorer.exe \"https://deliveroojs.onrender.com/\" >/dev/null 2>&1 || true) && node src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@unitn-asa/deliveroo-js-client": "^2.0.3",
+    "@unitn-asa/deliveroo-js-sdk/client": "^2.0.3",
     "@types/pddl-client": "^1.6.2"
   }
 }
