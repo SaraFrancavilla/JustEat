@@ -209,8 +209,6 @@ function nextSpawnPatrolTarget() {
  * Decide what to do next: DELIVER, PICKUP, or EXPLORE (frontier or spawner band).
  */
 
-
-
 export function deliberate() {
 
   console.log("Deliberating...");
@@ -245,14 +243,10 @@ export function deliberate() {
 
     if (lockedValid) {
       return { type: "DELIVER", target: forcedDeliveryTarget };
+    }else{
+      forcedDeliveryTarget = null; //reset if target becomes invalid for some reason (e.g. blacklisted)
     }
 
-    if (dz && !isGoalBlacklisted(dz)) {
-      forcedDeliveryTarget = { x: dz.x, y: dz.y };
-      return { type: "DELIVER", target: forcedDeliveryTarget };
-    }
-
-    forcedDeliveryTarget = null;
   }
 
   // Only consider DELIVER when actually carrying something
@@ -260,8 +254,9 @@ export function deliberate() {
     const d = manhattan(W.me.x, W.me.y, dz.x, dz.y);
 
     // If we are basically on the delivery tile or if we have many parcels, deliver
-    //MIGLIORA PARAMETRI
+
     if (d <= 1 || total >= 80 ) {
+      forcedDeliveryTarget = { x: dz.x, y: dz.y };
       return { type: "DELIVER", target: dz };
     }
 
