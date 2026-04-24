@@ -3,7 +3,7 @@ import { DELTA, DIRS, inverseDir } from "../utils/directions.js";
 import { R, key, manhattan } from "../utils/math.js";
 import { inKnownBounds, seedLocalMap, setTile } from "../world/tiles.js";
 import { carriedParcels, canStep } from "../world/helpers.js";
-import { W } from "../world/state.js";
+import { W, rememberRecentPos } from "../world/state.js";
 import { debug, info, CFG } from "../config.js";
 
 export async function tryMoveDir(dir) {
@@ -38,6 +38,7 @@ export async function tryMoveDir(dir) {
   W.me.x = nx;
   W.me.y = ny;
   W.lastMove = dir;
+  rememberRecentPos(nx, ny);
 
   // Only seed unknown tiles as generic walkable; do not overwrite known type
   if (!W.tiles.has(nk)) {
@@ -50,6 +51,8 @@ export async function tryMoveDir(dir) {
 }
 
 export function rankedDirsToward(target = null) {
+  const recent = W.recentPos ?? [];
+
   const out = DIRS.map(d => {
     const fromX = R(W.me.x);
     const fromY = R(W.me.y);
@@ -67,6 +70,13 @@ export function rankedDirsToward(target = null) {
     if (W.boxPos.has(nk)) score += 20;
 
     if (W.badNeighbors?.get(nk)) score += W.badNeighbors.get(nk);
+
+    const recentIdx = recent.lastIndexOf(nk);
+    if (recentIdx !== -1) {
+      // More recent positions get a stronger penalty to avoid oscillation.
+      const age = recent.length - 1 - recentIdx;
+      score += Math.max(0, 12 - 2 * age);
+    }
 
     if (W.lastMove && inverseDir(W.lastMove) === d.dir) score += 1;
 

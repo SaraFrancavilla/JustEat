@@ -19,6 +19,7 @@ export const W = {
   tempBlocked: new Map(),
   badGoals: new Map(),
   badNeighbors: new Map(),
+  recentPos: [],
 
   minX: Infinity,
   maxX: -Infinity,
@@ -27,12 +28,24 @@ export const W = {
   lastMove: null
 };
 
+export function rememberRecentPos(x, y) {
+  const k = `${Math.round(Number(x))},${Math.round(Number(y))}`;
+  if (!k) return;
+
+  W.recentPos.push(k);
+
+  if (W.recentPos.length > 8) {
+    W.recentPos.shift();
+  }
+}
+
 export let deliveryDirty = false;
 export function setDeliveryDirty(v) { deliveryDirty = v; }
 
 export function syncCaches() {
   // Always rebuild — events.js writes W.parcels directly
   W.parcelList = [...W.parcels.values()];
+  console.log('[DBG SYNC] syncCaches: W.parcels.size=', W.parcels.size, '→ W.parcelList=', W.parcelList.length);
 
   W.spawnTiles = [];
   W.deliveryTiles = [];

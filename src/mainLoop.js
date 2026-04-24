@@ -54,6 +54,7 @@ export async function tick() {
 
   try {
     syncCaches();
+    console.log('[DBG WORLD] spawnTiles=', W.spawnTiles.length, W.spawnTiles);
 
     // Immediate pickup / putdown always has priority
     if (await reactiveAction()) {
@@ -112,10 +113,11 @@ export async function tick() {
 
       if (!didSomething) {
         // Stay on spawner tiles when empty-handed: it's a valid waiting behavior
-        if (tile?.spawner && W.carrying.size === 0) {
-          clearTargetFailureMemory(intention.target);
-          return;
-        }
+        // if (tile?.spawner && W.carrying.size === 0) {
+        //   clearTargetFailureMemory(intention.target);
+        //   return;
+        // }
+        //to not get stuck on delivery tiles when empty or when delivery fails for some reason, we blacklist them immediately after trying to act on them
 
         // Delivery tiles should not be sticky when empty / inactive
         if (tile?.delivery) {

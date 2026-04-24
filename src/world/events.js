@@ -47,15 +47,25 @@ client.onMap((width, height, tiles) => {
 });
 
 client.onParcelsSensing(list => {
+  console.log('[DBG EVENTS] onParcelsSensing called with', list?.length || 0, 'items');
+  
   W.parcels.clear();
 
   for (const raw of list) {
     const p = raw?.parcel ?? raw;
-    if (!p?.id) continue;
+    if (!p?.id) {
+      console.log('[DBG EVENTS] Skipping invalid parcel:', raw);
+      continue;
+    }
 
     // Store free parcels and parcels the agent is carrying — skip other agents' carried parcels
     const carriedByMe = p.carriedBy === W.me?.id;
     const isFree = p.carriedBy == null;
+
+    console.log('[DBG EVENTS] Parcel', p.id, ':', {
+      x: p.x, y: p.y, reward: p.reward, carriedBy: p.carriedBy, 
+      isFree, carriedByMe, willStore: isFree || carriedByMe
+    });
 
     if (isFree || carriedByMe) {
       W.parcels.set(String(p.id), {
@@ -67,4 +77,6 @@ client.onParcelsSensing(list => {
       });
     }
   }
+  
+  console.log('[DBG EVENTS] After parsing: W.parcels.size =', W.parcels.size);
 });
