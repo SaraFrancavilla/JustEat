@@ -81,6 +81,25 @@ export function bestParcel() {
   return best;
 }
 
+function bestAdjacentParcel() {
+  let best = null;
+  let bestReward = -Infinity;
+
+  for (const p of W.parcelList) {
+    if (p.carriedBy) continue;
+    if (isGoalBlacklisted(p)) continue;
+    if (manhattan(W.me.x, W.me.y, p.x, p.y) !== 1) continue;
+
+    const reward = Number(p.reward ?? 0);
+    if (reward > bestReward) {
+      bestReward = reward;
+      best = p;
+    }
+  }
+
+  return best;
+}
+
 export function bestKnownApproachTile(tx, ty) {
   let best = null;
   let bestScore = Infinity;
@@ -176,21 +195,6 @@ function nextSpawnPatrolTarget() {
   const n = spawns.length;
   if (n === 0) return null;
 
-  // if (spawnPatrolIndex < 0 || spawnPatrolIndex >= n) {
-  //   // Initialize patrol from the nearest spawn to avoid long first detours.
-  //   let nearestIdx = 0;
-  //   let nearestD = Infinity;
-  //   for (let i = 0; i < n; i++) {
-  //     const s = spawns[i];
-  //     const d = manhattan(W.me.x, W.me.y, s.x, s.y);
-  //     if (d < nearestD) {
-  //       nearestD = d;
-  //       nearestIdx = i;
-  //     }
-  //   }
-  //   spawnPatrolIndex = nearestIdx;
-  // }
-
   if (spawnPatrolIndex < 0 || spawnPatrolIndex >= n) {
     spawnPatrolIndex = 0;
   }
@@ -199,24 +203,6 @@ function nextSpawnPatrolTarget() {
   spawnPatrolIndex = (spawnPatrolIndex + 1) % n;
   return { x: s.x, y: s.y };
 
-
-  // // Walk the spawn array in order and pick the next suitable stop.
-  // for (let step = 1; step <= n; step++) {
-  //   const idx = (spawnPatrolIndex + step) % n;
-  //   const s = spawns[idx];
-  //   const here = R(W.me.x) === R(s.x) && R(W.me.y) === R(s.y);
-
-  //   if (here && n > 1) continue;
-  //   if (isGoalBlacklisted(s)) continue;
-
-  //   spawnPatrolIndex = idx;
-  //   return { x: s.x, y: s.y };
-  // }
-
-  // Fallback: if everything is blacklisted, still keep advancing in the cycle.
-  // spawnPatrolIndex = (spawnPatrolIndex + 1) % n;
-  // const s = spawns[spawnPatrolIndex];
-  // return { x: s.x, y: s.y };
 }
 
 /**
@@ -240,6 +226,15 @@ export function deliberate() {
 
   if (!carried.length) {
     forcedDeliveryTarget = null;
+  }
+
+  // Priority rule: if a free parcel is adjacent, go pick it up even when
+  // delivery threshold logic would normally force delivery.
+  const adjacentParcel = bestAdjacentParcel();
+  if (adjacentParcel) {
+    forcedDeliveryTarget = null;
+    console.log('[DBG] Adjacent parcel priority:', adjacentParcel.id, 'reward:', adjacentParcel.reward);
+    return { type: "PICKUP", target: adjacentParcel };
   }
 
   // Sticky deliver mode: once threshold is reached, keep delivering

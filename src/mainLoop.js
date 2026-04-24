@@ -54,7 +54,6 @@ export async function tick() {
 
   try {
     syncCaches();
-    console.log('[DBG WORLD] spawnTiles=', W.spawnTiles.length, W.spawnTiles);
 
     // Immediate pickup / putdown always has priority
     if (await reactiveAction()) {
