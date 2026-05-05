@@ -48,18 +48,28 @@ export function isWalkable(x, y, goalKey = null) {
 }
 
 function allowsExit(tile, dir) {
+  
   if (!tile) return true;
-
-  // One-way semantics from tiles.js/classifyTileType
+  
+  // Entering a one-way tile from the opposite direction is forbidden.
+  // Once on the tile, movement is unrestricted.
   if (tile.oneWay) {
-    return tile.oneWay === dir;
+    //return tile.oneWay === dir;
+    const opposite = {
+      up: "down",
+      down: "up",
+      left: "right",
+      right: "left"
+    }
+    [tile.oneWay] ?? null;
+    return dir !== opposite;
   }
 
   return true;
 }
 
 export function canStep(fromX, fromY, dir, toX, toY, goalKey = null) {
-  const fromK = key(fromX, fromY);
+  //const fromK = key(fromX, fromY);
   const toK = key(toX, toY);
 
   if (!inKnownBounds(toX, toY)) return false;
@@ -72,8 +82,7 @@ export function canStep(fromX, fromY, dir, toX, toY, goalKey = null) {
   if (toK !== goalKey && W.agentPos.has(toK)) return false;
   if (W.tempBlocked.has(toK)) return false;
 
-  const fromTile = W.tiles.get(fromK);
-  if (fromTile && !allowsExit(fromTile, dir)) return false;
+  if (!allowsExit(toTile, dir)) return false;
 
   return true;
 }

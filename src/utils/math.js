@@ -2,17 +2,20 @@ export const R = v => Math.round(v);
 
 export const key = (x, y) => `${R(x)},${R(y)}`;
 
-// export const manhattan = (ax, ay, bx, by) =>
-//     Math.abs(R(ax) - R(bx)) + Math.abs(R(ay) - R(by));
 
 export const manhattan = (ax, ay, bx, by) => {
-    if (![ax, ay, bx, by].every(Number.isFinite)) {
-        console.warn("⚠️ NaN detected in manhattan:", ax, ay, bx, by);
+    if (
+        !Number.isFinite(ax) ||
+        !Number.isFinite(ay) ||
+        !Number.isFinite(bx) ||
+        !Number.isFinite(by)
+    ) {
         return Infinity;
     }
 
-    return Math.abs(Math.round(ax) - Math.round(bx)) +
-           Math.abs(Math.round(ay) - Math.round(by));
+    const dx = R(ax) - R(bx);
+    const dy = R(ay) - R(by);
+    return Math.abs(dx) + Math.abs(dy);
 };
 
 export function samePos(a, b) {

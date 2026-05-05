@@ -1,7 +1,7 @@
 import { W, syncCaches, intention, clearIntention } from "./world/state.js";
 import { reactiveAction } from "./behavior/reactive.js";
 import { fallbackMove, tryMoveDir } from "./behavior/movement.js";
-import { deliberate, planPathToTarget } from "./planning/targeting.js";
+import { deliberate, planPathToTarget, completeSpawnPatrol } from "./planning/targeting.js";
 import { samePos, sameTarget } from "./utils/directions.js";
 import { blacklistGoal } from "./world/helpers.js";
 import { CFG, debug } from "./config.js";
@@ -47,8 +47,6 @@ function clearTargetFailureMemory(target = null) {
 }
 
 export async function tick() {
-  console.log("Tick...");
-
   if (!W.me || busy) return;
   busy = true;
 
@@ -102,8 +100,8 @@ export async function tick() {
 
       clearTargetFailureMemory();
 
-      debug("Known", W.tiles.size, "Parcels", W.parcelList.length, "Deliveries", W.deliveryTiles?.length ?? 0);
-      debug("New plan", intention.type, intention.target, "path", Array.isArray(intention.path) ? intention.path.length : "null");
+      // debug("Known", W.tiles.size, "Parcels", W.parcelList.length, "Deliveries", W.deliveryTiles?.length ?? 0);
+      // debug("New plan", intention.type, intention.target, "path", Array.isArray(intention.path) ? intention.path.length : "null");
     }
 
     if (intention.target && samePos(W.me, intention.target)) {
@@ -111,16 +109,15 @@ export async function tick() {
       const tile = W.tiles.get(key(W.me.x, W.me.y));
 
       if (!didSomething) {
-        // Stay on spawner tiles when empty-handed: it's a valid waiting behavior
-        // if (tile?.spawner && W.carrying.size === 0) {
-        //   clearTargetFailureMemory(intention.target);
-        //   return;
-        // }
-        //to not get stuck on delivery tiles when empty or when delivery fails for some reason, we blacklist them immediately after trying to act on them
-
+      
         // Delivery tiles should not be sticky when empty / inactive
         if (tile?.delivery) {
           blacklistGoal(intention.target);
+        }
+
+        // Complete PATROL when reached
+        if (intention.type === "PATROL") {
+          completeSpawnPatrol();
         }
 
         clearIntention();

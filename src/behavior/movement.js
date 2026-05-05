@@ -14,16 +14,16 @@ export async function tryMoveDir(dir) {
   const ny = fromY + dy;
   const nk = key(nx, ny);
 
-  debug("Trying move", dir, "to", nk);
+  //debug("Trying move", dir, "to", nk);
 
   if (!inKnownBounds(nx, ny)) {
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
-    debug("Move skipped out-of-bounds", dir, nk);
+    //debug("Move skipped out-of-bounds", dir, nk);
     return false;
   }
 
   if (!canStep(fromX, fromY, dir, nx, ny)) {
-    debug("Move skipped by canStep", dir, nk);
+    //debug("Move skipped by canStep", dir, nk);
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
     return false;
   }
@@ -31,7 +31,7 @@ export async function tryMoveDir(dir) {
   const ok = await api.move(dir);
   if (!ok) {
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
-    debug("Move failed", dir, nk);
+    //debug("Move failed", dir, nk);
     return false;
   }
 
@@ -46,7 +46,7 @@ export async function tryMoveDir(dir) {
   }
   seedLocalMap();
 
-  info("Move", dir);
+  //info("Move", dir);
   return true;
 }
 
@@ -100,10 +100,7 @@ export function rankedDirsToward(target = null) {
 
 export async function fallbackMove(target = null) {
   const candidates = rankedDirsToward(target);
-  debug(
-    "Fallback candidates",
-    candidates.map(c => `${c.dir}:${c.score.toFixed(1)}`).join(" ")
-  );
+  //debug("Fallback candidates", candidates.map(c => `${c.dir}:${c.score.toFixed(1)}`).join(" "));
 
   for (const c of candidates) {
     if (!canStep(R(W.me.x), R(W.me.y), c.dir, c.nx, c.ny)) continue;

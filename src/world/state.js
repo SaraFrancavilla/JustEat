@@ -45,7 +45,7 @@ export function setDeliveryDirty(v) { deliveryDirty = v; }
 export function syncCaches() {
   // Always rebuild — events.js writes W.parcels directly
   W.parcelList = [...W.parcels.values()];
-  console.log('[DBG SYNC] syncCaches: W.parcels.size=', W.parcels.size, '→ W.parcelList=', W.parcelList.length);
+  //console.log('[DBG SYNC] syncCaches: W.parcels.size=', W.parcels.size, '→ W.parcelList=', W.parcelList.length);
 
   W.spawnTiles = [];
   W.deliveryTiles = [];

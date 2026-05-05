@@ -8,8 +8,8 @@ import { CFG } from "../config.js";
 
 //per permettere una consegna obbligata
 let forcedDeliveryTarget = null;
-//REMOVE IF IT DOESNT WORK: to avoid getting stuck on impossible delivery targets, we track failures and blacklist after a threshold
 let spawnPatrolIndex = -1;
+let currentSpawnPatrolTarget = null;
 
 //creating variable to avoid computing frontier if non is found
 let existFrontier = true;
@@ -46,7 +46,7 @@ export function bestParcel() {
   let best = null;
   let bestU = -Infinity;
 
-  console.log('[DBG] bestParcel scanning:', W.parcelList.length, 'parcels');
+  // console.log('[DBG] bestParcel scanning:', W.parcelList.length, 'parcels');
   
   let carriedByCount = 0;
   let blacklistedCount = 0;
@@ -64,7 +64,7 @@ export function bestParcel() {
 
     consideredCount++;
     const u = utility(p);
-    console.log('[DBG] Parcel', p.id, 'at', p.x, p.y, 'reward:', p.reward, 'utility:', u.toFixed(2));
+    // console.log('[DBG] Parcel', p.id, 'at', p.x, p.y, 'reward:', p.reward, 'utility:', u.toFixed(2));
     
     if (u > bestU) {
       bestU = u;
@@ -72,11 +72,11 @@ export function bestParcel() {
     }
   }
   
-  if (best) {
-    console.log('[DBG] BEST parcel:', best.id, 'at', best.x, best.y, 'utility:', bestU.toFixed(2));
-  } else {
-    console.log('[DBG] NO BEST PARCEL FOUND');
-  }
+  // if (best) {
+  //   // console.log('[DBG] BEST parcel:', best.id, 'at', best.x, best.y, 'utility:', bestU.toFixed(2));
+  // } else {
+  //   // console.log('[DBG] NO BEST PARCEL FOUND');
+  // }
   
   return best;
 }
@@ -147,29 +147,30 @@ export function frontierTiles() {
   return arr;
 }
 
-export function bestFrontierTarget() {
+//In realtà non ci sono frontier da esplorare
+// export function bestFrontierTarget() {
 
-  console.log('[DBG] frontierTiles count:', frontierTiles().length);
+//   console.log('[DBG] frontierTiles count:', frontierTiles().length);
 
-  let best = null;
-  let bestScore = Infinity;
+//   let best = null;
+//   let bestScore = Infinity;
 
-  for (const t of frontierTiles()) {
-    if (isGoalBlacklisted(t)) continue;
+//   for (const t of frontierTiles()) {
+//     if (isGoalBlacklisted(t)) continue;
 
-    const path = aStar(W.me.x, W.me.y, t.x, t.y);
-    if (path === null) continue;
+//     const path = aStar(W.me.x, W.me.y, t.x, t.y);
+//     if (path === null) continue;
 
-    const score = path.length;
+//     const score = path.length;
 
-    if (score < bestScore) {
-      bestScore = score;
-      best = { x: t.x, y: t.y, path };
-    }
-  }
+//     if (score < bestScore) {
+//       bestScore = score;
+//       best = { x: t.x, y: t.y, path };
+//     }
+//   }
 
-  return best;
-}
+//   return best;
+// }
 
 export function planPathToTarget(target) {
 
@@ -195,14 +196,26 @@ function nextSpawnPatrolTarget() {
   const n = spawns.length;
   if (n === 0) return null;
 
+  // If current target exists, is valid, and not blacklisted, return it without changing index
+  if (currentSpawnPatrolTarget && !isGoalBlacklisted(currentSpawnPatrolTarget)) {
+    return currentSpawnPatrolTarget;
+  }
+
+  // Otherwise advance to next spawn
   if (spawnPatrolIndex < 0 || spawnPatrolIndex >= n) {
     spawnPatrolIndex = 0;
   }
 
   const s = spawns[spawnPatrolIndex];
+  currentSpawnPatrolTarget = { x: s.x, y: s.y };
   spawnPatrolIndex = (spawnPatrolIndex + 1) % n;
-  return { x: s.x, y: s.y };
+  
+  return currentSpawnPatrolTarget;
 
+}
+
+export function completeSpawnPatrol() {
+  currentSpawnPatrolTarget = null;
 }
 
 /**
@@ -211,12 +224,12 @@ function nextSpawnPatrolTarget() {
 
 export function deliberate() {
 
-  console.log("Deliberating...");
-  console.log('[DBG] W.tiles.size:', W.tiles.size, 'known bounds:', 
-    W.minX !== Infinity ? `${W.minX}-${W.maxX}, ${W.minY}-${W.maxY}` : 'NOT SET');
-  console.log('[DBG] Available: spawners=', W.spawnTiles.length, 
-    'deliveries=', W.deliveryTiles.length,
-    'parcels=', W.parcelList.length);
+  //console.log("Deliberating...");
+  //console.log('[DBG] W.tiles.size:', W.tiles.size, 'known bounds:', 
+  //  W.minX !== Infinity ? `${W.minX}-${W.maxX}, ${W.minY}-${W.maxY}` : 'NOT SET');
+  //console.log('[DBG] Available: spawners=', W.spawnTiles.length, 
+  //  'deliveries=', W.deliveryTiles.length,
+  //  'parcels=', W.parcelList.length);
 
   const carried = carriedParcels();
   const total = carried.reduce((s, p) => s + p.reward, 0);
@@ -231,7 +244,7 @@ export function deliberate() {
   const adjacentParcel = bestAdjacentParcel();
   if (adjacentParcel) {
     forcedDeliveryTarget = null;
-    console.log('[DBG] Adjacent parcel priority:', adjacentParcel.id, 'reward:', adjacentParcel.reward);
+    //console.log('[DBG] Adjacent parcel priority:', adjacentParcel.id, 'reward:', adjacentParcel.reward);
     return { type: "PICKUP", target: adjacentParcel };
   }
 
@@ -255,7 +268,7 @@ export function deliberate() {
 
     // If we are basically on the delivery tile or if we have many parcels, deliver
 
-    if (d <= 1 || total >= 80 ) {
+    if (d <= 1 || total >= 80 || carried.length == W.parcelList.length) {
       forcedDeliveryTarget = { x: dz.x, y: dz.y };
       return { type: "DELIVER", target: dz };
     }
@@ -271,31 +284,34 @@ export function deliberate() {
 
   const p = bestParcel();
   if (p && p != 0){
-    console.log('[DBG] bestParcel selected:', p.id, 'reward:', p.reward);
+    //console.log('[DBG] bestParcel selected:', p.id, 'reward:', p.reward);
     return { type: "PICKUP", target: p };
   } 
 
-  //computing frontier can be expensive, so we track if we found any in the last deliberation 
-  // and skip if none found before
-  if (existFrontier) {
-    console.log('[DBG] Checking for frontier targets...');
-    const frontier = bestFrontierTarget();
-    if (frontier) {
-      console.log('[DBG] bestFrontierTarget selected:', frontier.x, frontier.y);
-      return { type: "EXPLORE", target: { x: frontier.x, y: frontier.y } };
-    } else existFrontier = false; //avoid computing frontier again if none found
-  }
-
-  // No parcels and no frontier: go to spawner area
+        // No parcels and no frontier: go to spawner area
   if (W.spawnTiles.length > 0) {
-    console.log('[DBG NOW] No parcels or frontier. Patrolling spawn area...');
+    //console.log('[DBG NOW] No parcels or frontier. Patrolling spawn area...');
     const patrol = nextSpawnPatrolTarget();
     if (patrol) {
-      console.log('[DBG] Spawn patrol target:', patrol.x, patrol.y, 'idx=', spawnPatrolIndex);
-      return { type: "EXPLORE", target: patrol };
+      //console.log('[DBG] Spawn patrol target:', patrol.x, patrol.y, 'idx=', spawnPatrolIndex);
+      return { type: "PATROL", target: patrol };
     }
   }
 
-  console.log('[DBG] No valid target found.');
+
+  //computing frontier can be expensive, so we track if we found any in the last deliberation 
+  // and skip if none found before
+  // if (existFrontier) {
+  //   //console.log('[DBG] Checking for frontier targets...');
+  //   const frontier = bestFrontierTarget();
+  //   if (frontier) {
+  //     //console.log('[DBG] bestFrontierTarget selected:', frontier.x, frontier.y);
+  //     return { type: "EXPLORE", target: { x: frontier.x, y: frontier.y } };
+  //   } else existFrontier = false; //avoid computing frontier again if none found
+  // }
+
+
+
+  //console.log('[DBG] No valid target found.');
   return { type: "EXPLORE", target: null };
 }
