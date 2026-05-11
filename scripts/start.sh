@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
-PROJECT_DIR="/mnt/c/Users/anjel/Desktop/ASA/Project"
-PAAS_DIR="$HOME/tools/planning-as-a-service/server"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PAAS_DIR="${PAAS_DIR:-$HOME/tools/planning-as-a-service/server}"
+
+if [[ ! -d "$PAAS_DIR" ]]; then
+  echo "[PaaS] Directory not found: $PAAS_DIR"
+  echo "[PaaS] Run 'npm run setup' first from WSL/Ubuntu."
+  exit 1
+fi
 
 cleanup() {
   echo ""
   echo "[PaaS] Stopping containers..."
-  cd "$PAAS_DIR"
-  docker compose down
+  if [[ -d "$PAAS_DIR" ]]; then
+    cd "$PAAS_DIR"
+    docker compose down
+  fi
 }
 
 trap cleanup EXIT INT TERM
