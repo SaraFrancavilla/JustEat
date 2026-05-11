@@ -14,16 +14,12 @@ export async function tryMoveDir(dir) {
   const ny = fromY + dy;
   const nk = key(nx, ny);
 
-  //debug("Trying move", dir, "to", nk);
-
   if (!inKnownBounds(nx, ny)) {
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
-    //debug("Move skipped out-of-bounds", dir, nk);
     return false;
   }
 
   if (!canStep(fromX, fromY, dir, nx, ny)) {
-    //debug("Move skipped by canStep", dir, nk);
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
     return false;
   }
@@ -31,7 +27,6 @@ export async function tryMoveDir(dir) {
   const ok = await api.move(dir);
   if (!ok) {
     W.tempBlocked.set(nk, Date.now() + CFG.TEMP_BLOCK_MS);
-    //debug("Move failed", dir, nk);
     return false;
   }
 

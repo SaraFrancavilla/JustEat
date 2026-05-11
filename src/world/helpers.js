@@ -78,7 +78,7 @@ export function canStep(fromX, fromY, dir, toX, toY, goalKey = null) {
   if (!toTile) return false;
   if (!toTile.walkable) return false;
 
-  if (toK !== goalKey && W.boxPos.has(toK)) return false;
+  // if (toK !== goalKey && W.boxPos.has(toK)) return false;
   if (toK !== goalKey && W.agentPos.has(toK)) return false;
   if (W.tempBlocked.has(toK)) return false;
 

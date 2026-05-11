@@ -25,6 +25,7 @@ client.onMap((width, height, tiles) => {
   W.maxX = width - 1;
   W.minY = 0;
   W.maxY = height - 1;
+  W.boxPos.clear();
 
   const types = [...new Set(tiles.map(t => t.type))];
 

@@ -212,6 +212,8 @@ export function setTile(x, y, type = "3", guessed = false) {
   const k = key(rx, ry);
   const prev = W.tiles.get(k);
 
+  const isBoxOccupancyType = (tileType) => String(tileType ?? "").trim() === "5!";
+
   // If tile is already known (not guessed) and we're only providing
   // a generic type, preserve the existing type
   const resolvedType =
@@ -229,6 +231,14 @@ export function setTile(x, y, type = "3", guessed = false) {
 
   W.tiles.set(k, merged);
   updateBounds(rx, ry);
+
+  // Keep dynamic box occupancy in sync with tile updates.
+  // In this map format, "5!" marks a box currently occupying the special cell.
+  if (isBoxOccupancyType(merged.type)) {
+    W.boxPos.add(k);
+  } else if (prev && isBoxOccupancyType(prev.type)) {
+    W.boxPos.delete(k);
+  }
 
   if (merged.delivery) {
     deliveryDirty = true;

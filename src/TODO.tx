@@ -1,9 +1,9 @@
 cose da migliorare dell’agente:
-- migliorare in mappe grandi
-- più veloci
-- più bravi a gestire gli altri agenti
+- DONE ------   migliorare in mappe grandi
+- DONE ------ più veloci
+- DONE ------ più bravi a gestire gli altri agenti
 - 26c1_3 con più agenti: da migliorare
-- prima di salire su una directional tile dovrebbe capire prima se poi può scendere dalla directional tile o se la tile dopo è bloccata
-- le directional tile dicono che non puoi tornare indietro in quella direzione ma di lato ci puoi andare
-- explore strano, sembrava che non volesse passare sulla zona delivery senza pacco e ci è andato intorno
-- deve capire quando le delivery tile sono bloccate da un agente che ci sta sopra
+- DONE ------ prima di salire su una directional tile dovrebbe capire prima se poi può scendere dalla directional tile o se la tile dopo è bloccata
+- DONE ------   le directional tile dicono che non puoi tornare indietro in quella direzione ma di lato ci puoi andare
+- DONE ------  explore strano, sembrava che non volesse passare sulla zona delivery senza pacco e ci è andato intorno
+- DONE ------ deve capire quando le delivery tile sono bloccate da un agente che ci sta sopra
