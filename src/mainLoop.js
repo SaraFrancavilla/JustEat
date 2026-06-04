@@ -1,13 +1,32 @@
 import { W, visitedSpawns, syncCaches, intention, clearIntention } from "./world/state.js";
-import { reactiveAction } from "./behavior/reactive.js";
+import { isCrateMap, computeMapProfile, computeStrategy } from "./world/mapAnalysis.js";
+import { proposeReactiveAction } from "./behavior/reactive.js";
+import { executeActionIntent, waitAction } from "./behavior/actions.js";
 import { fallbackMove, tryMoveDir } from "./behavior/movement.js";
-import { deliberate, planPathToTarget, completeSpawnPatrol, getOldestUnseenSpawn } from "./planning/targeting.js";
+import {
+  deliberate,
+  planPathToTarget,
+  completeSpawnPatrol,
+  getOldestUnseenSpawn,
+  hasOpportunisticNearbyParcel,
+  bestOpportunisticNearbyParcel,
+} from "./planning/targeting.js";
 import { samePos, sameTarget } from "./utils/directions.js";
 import { blacklistGoal } from "./world/helpers.js";
 import { CFG, debug } from "./config.js";
 import { key } from "./utils/math.js";
-
-import { LLMCoordinationAgent } from "./llm/agent.mjs";
+import {
+  pruneExpiredMissions,
+  processMissionQueue,
+  getMissionPolicy,
+  enqueueTrustedMissionMessage,
+} from "./llm/missions.mjs";
+import {
+  callModel,
+  runCoordinationCycle,
+  LLMCoordinationAgent,
+} from "./llm/agent.mjs";
+import { coordination } from "./llm/tools.mjs";
 import client from "./client.js";
 
 let busy = false;
@@ -23,9 +42,18 @@ const TEAMMATE_ID =
   process.argv.find((a) => a.startsWith("--teamId="))?.split("=")[1] ||
   null;
 
-// Local retry tracking for oscillation/stuck situations
+// Local retry tracking
 let lastFailedTargetKey = null;
 let failedTargetCount = 0;
+let failedStepCount = 0;
+
+// Vision radius
+const SENSOR_RADIUS = 5;
+
+// Map analysis
+let map_analysis_done = false;
+let last_branching_factor = 0;
+let strategy_check_counter = 0;
 
 function targetKey(target) {
   if (!target) return null;
@@ -34,7 +62,7 @@ function targetKey(target) {
 
 function registerTargetFailure(target) {
   const k = targetKey(target);
-  if (!k) return 0;
+  if (!k) return { targetFails: 0, stepFails: 0 };
 
   if (k === lastFailedTargetKey) {
     failedTargetCount += 1;
@@ -43,34 +71,57 @@ function registerTargetFailure(target) {
     failedTargetCount = 1;
   }
 
-  return failedTargetCount;
+  failedStepCount += 1;
+  return { targetFails: failedTargetCount, stepFails: failedStepCount };
 }
 
 function clearTargetFailureMemory(target = null) {
   if (!target) {
     lastFailedTargetKey = null;
     failedTargetCount = 0;
+    failedStepCount = 0;
     return;
   }
 
-  const k = targetKey(target);
-  if (k === lastFailedTargetKey) {
+  if (targetKey(target) === lastFailedTargetKey) {
     lastFailedTargetKey = null;
     failedTargetCount = 0;
+    failedStepCount = 0;
   }
 }
 
-// Only create LLM agent once we actually know who we are
+function currentPlanLooksCrateSensitive() {
+  if (!Array.isArray(intention.path) || intention.path.length === 0) return false;
+  if (!W.me) return false;
+
+  let { x, y } = W.me;
+
+  for (const dir of intention.path.slice(0, 3)) {
+    const d = {
+      up: { dx: 0, dy: 1 },
+      down: { dx: 0, dy: -1 },
+      left: { dx: -1, dy: 0 },
+      right: { dx: 1, dy: 0 },
+    }[dir];
+    if (!d) continue;
+
+    x += d.dx;
+    y += d.dy;
+
+    if (W.boxPos?.has(key(x, y))) return true;
+  }
+  return false;
+}
+
+function shouldRelaxFailureHandling() {
+  return isCrateMap() && currentPlanLooksCrateSensitive();
+}
+
 function getLLMAgent() {
   if (!llmAgent && W.me) {
     llmAgent = new LLMCoordinationAgent(client);
   }
   return llmAgent;
-}
-
-function toPoint(v) {
-  if (!v || v.x == null || v.y == null) return null;
-  return { x: Number(v.x), y: Number(v.y) };
 }
 
 function dist2(a, b) {
@@ -81,9 +132,7 @@ function dist2(a, b) {
 }
 
 function nearestDeliveryTarget() {
-  if (!W.me || !Array.isArray(W.deliveryTiles) || W.deliveryTiles.length === 0) {
-    return null;
-  }
+  if (!W.me || !Array.isArray(W.deliveryTiles) || W.deliveryTiles.length === 0) return null;
 
   let best = null;
   let bestD = Infinity;
@@ -95,250 +144,258 @@ function nearestDeliveryTarget() {
       best = { x: t.x, y: t.y };
     }
   }
-
   return best;
 }
 
-function missionIsActive() {
-  return Boolean(
-    W.activeMission?.accepted && W.activeMission?.status === "active"
-  );
+function shouldPreferOpportunisticPickup(mission, next = null) {
+  if (!next) return false;
+  if (!["DELIVER", "EXPLORE", "PATROL", "MOVE"].includes(next.type)) return false;
+  if (mission?.mode === "WAIT" || mission?.avoidPickup || mission?.forceDelivery) return false;
+
+  const carrying = W.carrying?.size ?? 0;
+  if (carrying >= (CFG.REACT_HARD_CARRY_LIMIT ?? 15)) return false;
+
+  return hasOpportunisticNearbyParcel(mission);
 }
 
-function missionNextAction() {
-  const mission = W.activeMission;
-  if (!mission || mission.status !== "active") return null;
-
-  if (mission.objectiveType === "wait") {
-    const until = mission.policy?.wait?.until ?? 0;
-    if (Date.now() < until) {
-      return { type: "WAIT", target: null };
-    }
-
-    W.activeMission.status = "completed";
-    W._lastMissionId = null;
-    console.log("[MISSION] Wait mission completed.");
-    return null;
-  }
-
-  if (mission.objectiveType === "deliver_rule") {
-    return null;
-  }
-
-  return null;
+function opportunisticPickupPlan(mission) {
+  const parcel = bestOpportunisticNearbyParcel(mission);
+  if (!parcel) return null;
+  return { type: "PICKUP", target: { x: Number(parcel.x), y: Number(parcel.y) } };
 }
 
-function ensureMissionPlanConsistency() {
-  if (!missionIsActive()) return;
+function ensureMissionPlanConsistency(mission) {
+  const missionId = mission?.missionId ?? null;
+  const missionSignature = mission?.missionSignature ?? null;
 
-  if (W._lastMissionId !== W.activeMission.id) {
+  const changed =
+    (missionId != null && W._lastMissionId !== missionId) ||
+    (missionId == null && missionSignature && W._lastMissionSignature !== missionSignature);
+
+  if (changed) {
     clearIntention();
-    W._lastMissionId = W.activeMission.id;
-    console.log("[MISSION] Cleared previous intention for mission replanning.");
+    W._lastMissionId = missionId;
+    W._lastMissionSignature = missionSignature;
+    console.log("[MISSION] Cleared previous intention for mission replanning. id=", missionId);
+  } else {
+    if (missionId != null) W._lastMissionId = missionId;
+    if (missionSignature) W._lastMissionSignature = missionSignature;
   }
 }
 
-function normalizeLLMPlan(plan) {
-  if (!plan || typeof plan !== "object") return null;
-  if (!plan.objective) return null;
+function normalizeLLMPlan(plan, mission) {
+  if (!plan?.objective) return null;
 
   if (plan.objective === "collect_parcel") {
-    const target = toPoint(plan.targetPosition);
-    if (!target) {
-      console.log("[LLM] collect_parcel rejected: missing/invalid targetPosition");
-      return null;
-    }
+    const target = plan.targetPosition
+      ? { x: Number(plan.targetPosition.x), y: Number(plan.targetPosition.y) }
+      : null;
+    if (!target) return null;
 
     if (plan.targetParcelId) {
       const parcel =
-        W.parcels.get(plan.targetParcelId) ||
-        W.parcelList.find((p) => p.id === plan.targetParcelId);
-
-      if (parcel && parcel.carriedBy) {
-        console.log(`[LLM] collect_parcel rejected: parcel ${plan.targetParcelId} already carried by ${parcel.carriedBy}`);
-        return null;
-      }
+        W.parcels?.get?.(plan.targetParcelId) ??
+        (Array.isArray(W.parcelList)
+          ? W.parcelList.find((p) => p.id === plan.targetParcelId)
+          : null);
+      if (parcel?.carriedBy) return null;
     }
-
-    return { type: "COLLECT", target };
+    return { type: "PICKUP", target };
   }
 
   if (plan.objective === "deliver_now") {
-    let target = null;
+    let target = plan.targetPosition
+      ? { x: Number(plan.targetPosition.x), y: Number(plan.targetPosition.y) }
+      : nearestDeliveryTarget();
 
-    // Prefer the LLM's chosen tile if it's actually a delivery tile
-    if (plan.targetPosition) {
-      const requested = toPoint(plan.targetPosition);
-      const isValid = [...W.deliveryTiles.values()].some(
-        t => t.x === requested?.x && t.y === requested?.y
-      );
-      if (isValid) target = requested;
-    }
-
-    // Fall back to nearest if the LLM's choice was invalid
-    if (!target) target = nearestDeliveryTarget();
     if (!target) return null;
 
-    return { type: "DELIVER", target };
+    const deliverPlan = { type: "DELIVER", target };
+    return shouldPreferOpportunisticPickup(mission, deliverPlan)
+      ? opportunisticPickupPlan(mission)
+      : deliverPlan;
   }
 
   if (plan.objective === "explore") {
-    // Try to patrol a known spawn tile first
-    const spawnTarget = getOldestUnseenSpawn(); 
-    if (spawnTarget) {
-      return { type: "PATROL", target: spawnTarget };
-    }
-    
-    // If no spawns need checking, explore the frontiers
-    return null; 
-  }
-
-  console.log(`[LLM] Plan rejected: unknown objective "${plan.objective}"`);
-  return null;
-}
-
-function consumeLLMPlan() {
-  const agent = getLLMAgent();
-  if (!agent) return null;
-  if (llmBusy) return null;
-  if (missionIsActive()) return null;
-
-  const plan = agent.getPendingPlan();
-  
-  if (!plan) return null;
-
-  const normalized = normalizeLLMPlan(plan);
-  agent.acknowledgePlan();
-
-  if (normalized) {
-    console.log(`[LLM] Using plan: ${plan.objective} -> Normalized to: ${normalized.type}`);
-    return normalized;
+    const spawnTarget = getOldestUnseenSpawn();
+    return spawnTarget
+      ? { type: "PATROL", target: spawnTarget }
+      : { type: "EXPLORE", target: null };
   }
 
   return null;
 }
 
-function maybeTriggerLLMCoordination() {
-  if (!W.me) return;
-  if (llmBusy) return;
-  if (missionIsActive()) return;
+function consumeLLMPlan(mission) {
+  if (mission?.mode === "WAIT") return null;
+
+  while (coordination.pendingMessages.length > 0) {
+    const msg = coordination.pendingMessages.shift();
+
+    if (msg?.type !== "llm_plan") continue;
+
+    console.log(`[LLM] Received plan from tool: ${msg.plan?.objective}`);
+    const normalized = normalizeLLMPlan(msg.plan, mission);
+    if (normalized) return normalized;
+  }
+
+  return null;
+}
+
+function maybeStartStrategyAnalysis() {
+  if (map_analysis_done || !W.tiles || W.tiles.size === 0) return;
+
+  strategy_check_counter++;
+
+  if (strategy_check_counter % 50 !== 0) return;
+
+  computeMapProfile();
+
+  const current_bf = W.mapProfile?.avgBranchingFactor ?? 0;
+
+  if (Math.abs(current_bf - last_branching_factor) < 0.15) {
+    map_analysis_done = true;
+    const strategy = computeStrategy();
+    console.log("[STRATEGY] Map stabilized, strategy computed:", JSON.stringify(strategy));
+  }
+
+  last_branching_factor = current_bf;
+}
+
+function maybeTriggerLLMCoordination(mission) {
+  if (!W.me || llmBusy || W.missionEvaluating || mission?.mode === "WAIT") return;
+
+  const activeMissions = [...(W.activeGoals || []), ...(W.activeRules || [])];
+  if (activeMissions.length === 0) return;
 
   tickCounter += 1;
-
-  // Only coordinate every N ticks
   if (tickCounter % LLM_COORDINATION_INTERVAL !== 0) return;
 
   const agent = getLLMAgent();
   if (!agent) return;
 
-  const request = JSON.stringify({
-    request: "Coordinate the next best high-level action for the team.",
-    instructions: "I have provided your current state. Use getvisibleparcels to see what is around you. If parcels are visible, calculate the distance to them (using x/y coordinates). DO NOT target a parcel if the distance to it is greater than or equal to its 'reward' value, because it will despawn before you arrive. If valid parcels exist, use send_plan_to_bdi with objective 'collect_parcel'. If NO valid parcels are visible, use send_plan_to_bdi with objective 'explore' and DO NOT include a targetPosition.",
-    teammateId: TEAMMATE_ID,
-    me: {
-      id: W.me.id,
-      name: W.me.name,
-      position: { x: W.me.x, y: W.me.y },
-      score: W.me.score
-    },
-    mapInfo: {
-      width: W.mapWidth,
-      height: W.mapHeight,
-      walkableTileCount: W.tiles.size
-    },
-    carryingCount: W.carrying?.size ?? 0,
-    currentIntention: intention.type
-      ? { type: intention.type, target: intention.target }
-      : null
-  });
+  const missionTexts = activeMissions.map((m) => `- [${m.kind}] ${m.text}`).join("\n");
 
-  llmBusy = true; // Set thinking flag
-  console.log("[LLM] Triggering coordination.");
+  const request = `
+MISSION ALERT!
+You have ${activeMissions.length} active missions/rules overlapping right now:
+${missionTexts}
+
+Use your tools to inspect the map, your state, and visible parcels.
+Figure out the safest action that complies with all rules, then call \`send_plan_to_bdi\`.
+  `.trim();
+
+  llmBusy = true;
+  console.log("[LLM] Waking up Mission Strategist. Missions active:", activeMissions.length);
 
   agent
     .coordinate(request)
-    .catch((err) => {
-      console.error("[LLM] coordination error:", err);
-    })
+    .catch((err) => console.error("[LLM] coordination error:", err))
     .finally(() => {
-      llmBusy = false; // Release thinking flag when done
+      llmBusy = false;
     });
 }
 
-const SENSOR_RADIUS = 5; 
-
 function updateSpatialMemory() {
   if (!W.me || !W.spawnTiles) return;
-
   const now = Date.now();
   for (const t of W.spawnTiles) {
-    const dist = Math.abs(W.me.x - t.x) + Math.abs(W.me.y - t.y);
-    
-    // If the spawn tile is within our vision radius, mark it as "seen recently"
-    if (dist <= SENSOR_RADIUS) {
+    if (Math.abs(W.me.x - t.x) + Math.abs(W.me.y - t.y) <= SENSOR_RADIUS) {
       visitedSpawns.set(`${t.x},${t.y}`, now);
     }
   }
 }
 
+function arbitratePlannedIntent(next, mission) {
+  if (!mission) return next;
+  if (mission.mode === "WAIT") return { type: "WAIT", target: null };
+  if (mission.avoidPickup && next?.type === "PICKUP") return null;
+  if (mission.avoidDelivery && next?.type === "DELIVER") return null;
+
+  if (shouldPreferOpportunisticPickup(mission, next)) {
+    const pickupPlan = opportunisticPickupPlan(mission);
+    if (pickupPlan) return pickupPlan;
+  }
+
+  if (mission.forceDelivery && !mission.avoidDelivery) {
+    const deliveryTarget = nearestDeliveryTarget();
+    if (deliveryTarget) return { type: "DELIVER", target: deliveryTarget };
+  }
+
+  return next;
+}
+
+async function tryReactiveFollowup(mission) {
+  let didAnything = false;
+  for (let i = 0; i < 4; i++) {
+    const intent = proposeReactiveAction(mission);
+    if (!intent) break;
+    const ok = await executeActionIntent(intent, mission);
+    if (!ok) break;
+    didAnything = true;
+    syncCaches();
+  }
+  return didAnything;
+}
+
 export async function tick() {
-  if (!W.me || busy) return;
+  if (!W.me || busy || W.prevActionFinished === false) return;
   busy = true;
 
   try {
+    await processMissionQueue();
+
     syncCaches();
+    computeMapProfile();
+    maybeStartStrategyAnalysis();
+    updateSpatialMemory();
+    pruneExpiredMissions();
 
-    // Update internal memory
-    updateSpatialMemory(); 
+    const mission = getMissionPolicy();
+    ensureMissionPlanConsistency(mission);
 
-    const missionAction = missionNextAction();
-
-    ensureMissionPlanConsistency();
-
-    if (missionIsActive() && missionAction?.type === "WAIT") {
+    if (mission?.mode === "WAIT") {
       if (intention.type !== "WAIT") {
         clearIntention();
         intention.type = "WAIT";
         intention.target = null;
         intention.steps = 0;
         intention.path = [];
-        console.log("[MISSION] Entered WAIT mode.");
       }
-
+      await executeActionIntent(waitAction("mission_wait"), mission);
       return;
     }
 
-    // Immediate pickup / putdown always has priority
-    if (await reactiveAction()) {
+    if (await tryReactiveFollowup(mission)) {
       clearTargetFailureMemory();
-      return;
-    };
-
-    // Leave early if patrol target entered vision and is empty
-    if (intention.type === "PATROL" && intention.target) {
-        const lastSeen = visitedSpawns.get(`${intention.target.x},${intention.target.y}`) || 0;
-        const timeUnseen = (Date.now() - lastSeen) / 1000;
-        
-        // if within sensor radius
-        if (timeUnseen < 1) {
-            const hasParcel = W.parcelList.some(p => p.x === intention.target.x && p.y === intention.target.y);
-            if (!hasParcel) {
-                // empty tile: clear intention and target the next unseen tile in this area
-                clearIntention();
-            }
-        }
+      clearIntention();
+      syncCaches();
     }
 
-    // Trigger LLM coordination in background
-    maybeTriggerLLMCoordination();
+    if (intention.type === "PATROL" && intention.target) {
+      const lastSeen = visitedSpawns.get(`${intention.target.x},${intention.target.y}`) || 0;
+      if (
+        (Date.now() - lastSeen) / 1000 < 1 &&
+        !W.parcelList.some((p) => p.x === intention.target.x && p.y === intention.target.y)
+      ) {
+        clearIntention();
+      }
+    }
 
-    // If an LLM plan is available, use it; otherwise normal BDI deliberation
-    const llmNext = consumeLLMPlan();
-    const next = llmNext || deliberate();
+    if (["DELIVER", "EXPLORE", "PATROL", "MOVE"].includes(intention.type)) {
+      if (shouldPreferOpportunisticPickup(mission, { type: intention.type })) {
+        clearIntention();
+      }
+    }
 
-    // Only log if the LLM actually gave us a plan right now
-    if (llmNext) {
-        console.log(`[DECISION] Switched to new LLM plan: ${next.type} at target:`, next.target);
+    maybeTriggerLLMCoordination(mission);
+
+    let next = consumeLLMPlan(mission) || deliberate(mission);
+    next = arbitratePlannedIntent(next, mission) || { type: "EXPLORE", target: null };
+
+    if (shouldPreferOpportunisticPickup(mission, next)) {
+      const pickupPlan = opportunisticPickupPlan(mission);
+      if (pickupPlan) next = pickupPlan;
     }
 
     const needNewPlan =
@@ -350,25 +407,16 @@ export async function tick() {
 
     if (needNewPlan) {
       let path = [];
-
       if (next.target) {
-        path = planPathToTarget(next.target);
+        path = planPathToTarget(next.target, {
+          avoidTiles: mission?.movement?.avoidTiles ?? mission?.avoidTiles ?? [],
+        });
 
-        if (path === null) {
-          blacklistGoal(next.target);
-          debug("Reject unreachable target", next.type, next.target);
+        if (!path || (path.length === 0 && !samePos(W.me, next.target))) {
+          if (!isCrateMap()) blacklistGoal(next.target);
           clearIntention();
           await fallbackMove(null);
-          await reactiveAction();
-          return;
-        }
-
-        if (path.length === 0 && !samePos(W.me, next.target)) {
-          blacklistGoal(next.target);
-          debug("Reject zero-path nonlocal target", next.type, next.target);
-          clearIntention();
-          await fallbackMove(null);
-          await reactiveAction();
+          await tryReactiveFollowup(mission);
           return;
         }
       }
@@ -377,28 +425,18 @@ export async function tick() {
       intention.target = next.target;
       intention.steps = 0;
       intention.path = path;
-
       clearTargetFailureMemory();
     }
 
     if (intention.target && samePos(W.me, intention.target)) {
-      const didSomething = await reactiveAction();
-      const tile = W.tiles.get(key(W.me.x, W.me.y));
-
-      if (!didSomething) {
-        if (tile?.delivery) {
-          blacklistGoal(intention.target);
-        }
-
-        if (intention.type === "PATROL") {
-          completeSpawnPatrol();
-        }
+      if (!(await tryReactiveFollowup(mission))) {
+        if (W.tiles.get(key(W.me.x, W.me.y))?.delivery) blacklistGoal(intention.target);
+        if (intention.type === "PATROL") completeSpawnPatrol();
 
         clearIntention();
         clearTargetFailureMemory(intention.target);
         await fallbackMove(null);
       }
-
       return;
     }
 
@@ -406,34 +444,50 @@ export async function tick() {
 
     if (Array.isArray(intention.path) && intention.path.length > 0) {
       const dir = intention.path.shift();
-      const ok = await tryMoveDir(dir);
 
-      if (!ok) {
-        const fails = registerTargetFailure(intention.target);
+      if (!(await tryMoveDir(dir))) {
+        const { targetFails } = registerTargetFailure(intention.target);
 
-        if (intention.target && fails >= 3) {
+        if (shouldRelaxFailureHandling()) {
+          clearIntention();
+        } else if (intention.target && targetFails >= 3) {
           blacklistGoal(intention.target);
-          debug("Blacklisting repeatedly failing target", intention.target, "fails", fails);
           clearIntention();
         } else {
           intention.steps = 0;
         }
 
         await fallbackMove(intention.target);
-        await reactiveAction();
+        await tryReactiveFollowup(mission);
         return;
       }
 
       clearTargetFailureMemory(intention.target);
-      await reactiveAction();
+      await tryReactiveFollowup(mission);
       return;
     }
 
     await fallbackMove(next.target);
-    await reactiveAction();
+    await tryReactiveFollowup(mission);
   } catch (err) {
     console.error(err);
   } finally {
     busy = false;
   }
 }
+
+client.onMsg((id, name, msg, reply) => {
+  const text = typeof msg === "string" ? msg : msg?.text;
+  if (!text) return;
+
+  console.log("[MSG] Received:", { id, name, text });
+
+  enqueueTrustedMissionMessage({
+    callModel,
+    runCoordinationCycle,
+    missionText: text,
+    replyCallback: reply,
+    senderId: id,
+    socket: client,
+  });
+});

@@ -1,4 +1,3 @@
-import 'dotenv/config';
 export const HOST = process.env.TEST_LOCAL === 'true' 
   ? "http://localhost:8080/" 
   : "https://deliveroojs.onrender.com/";
@@ -17,7 +16,14 @@ export const CFG = {
     DECAY_WEIGHT: 1.5,
     TEMP_BLOCK_MS: 1200,
     NO_GOAL_MS: 2500,
-    NO_PICKUP_AFTER_DELIVERY_MS: 1000
+    NO_PICKUP_AFTER_DELIVERY_MS: 1000,
+    CRATE_ASTAR_MAX_EXPANSIONS: 12000,
+    CRATE_ASTAR_MAX_PUSHES: 8,
+    CRATE_PUSH_PENALTY: 2,
+    PARCEL_CANDIDATE_LIMIT: 14,
+    PARCEL_CANDIDATE_LIMIT_CRATE: 10,
+    REACTIVE_NEAR_PARCEL_DIST: 3,
+    REACTIVE_HARD_PICKUP_LIMIT: 15,
 };
 
 

@@ -10,10 +10,33 @@ export function isSpawnTile(tile) {
   return t === "1";
 }
 
+export function carryingCount() {
+  return W.carrying?.size ?? 0;
+}
+
 export function carriedParcels() {
-  return W.parcelList.filter(
-    p => p.carriedBy === W.me?.id || W.carrying.has(p.id)
-  );
+  if (!W.carrying || W.carrying.size === 0) return [];
+
+  const out = [];
+  for (const rawId of W.carrying) {
+    const id = String(rawId);
+    const known = W.parcels.get(id);
+
+    if (known) {
+      out.push(known);
+      continue;
+    }
+
+    out.push({
+      id,
+      x: Number(W.me?.x ?? 0),
+      y: Number(W.me?.y ?? 0),
+      reward: 0,
+      carriedBy: W.me?.id ?? null,
+    });
+  }
+
+  return out;
 }
 
 export function onDeliveryTile() {
@@ -27,7 +50,7 @@ export function onDeliveryTile() {
 export function parcelsHere() {
   const here = key(W.me.x, W.me.y);
   return W.parcelList.filter(
-    p => !p.carriedBy && key(p.x, p.y) === here
+    (p) => !p.carriedBy && key(p.x, p.y) === here
   );
 }
 
@@ -58,20 +81,17 @@ function allowsEntry(fromTile, toTile, dir) {
   if (!toTile) return false;
   if (!toTile.oneWay) return true;
 
-  // Cannot enter from the steep drop direction
   if (dir === toTile.oneWay) return false;
 
-  // Entry from low-side: always allowed
   const opposite = {
     up: "down",
     down: "up",
     left: "right",
-    right: "left"
+    right: "left",
   }[toTile.oneWay];
 
   if (dir === opposite) return true;
 
-  // Sideways entry only allowed when already on a parallel ramp
   return !!fromTile?.oneWay && fromTile.oneWay === toTile.oneWay;
 }
 
@@ -130,7 +150,6 @@ export function canPushCrate(fromX, fromY, dir, toX, toY, goalKey = null, boxSet
   const finalDestTile = W.tiles.get(checkK);
   if (!isCrateTrackTile(finalDestTile)) return false;
 
-  // A crate can only end on an empty crate-track tile
   if (boxSet.has(checkK)) return false;
   if (W.agentPos.has(checkK)) return false;
   if (W.tempBlocked.has(checkK)) return false;

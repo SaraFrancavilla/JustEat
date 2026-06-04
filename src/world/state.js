@@ -25,7 +25,12 @@ export const W = {
   mapWidth: null,
   mapHeight: null,
 
-  activeMission: null,
+  activeGoals: [], // temporary missions to satisfy once and that's it
+  activeRules: [], // persistent constraints/modifiers of behavior
+  missionHistory: [],
+  missionEvaluating: false,
+  _lastMissionSignature: null,
+  _lastMissionId: null,
 
   minX: Infinity,
   maxX: -Infinity,
@@ -35,9 +40,11 @@ export const W = {
 
   mapProfile: null,
   strategy: {
-    carryTarget: 3, 
-    mapType: "Unknown"
-  }
+    mapType: "Unknown",
+    carryTarget: 3,
+  },
+
+  prevActionFinished: true,
 
 };
 
@@ -65,34 +72,7 @@ export function syncCaches() {
   W.baseTiles = [];
   W.specialTiles = [];
   W.oneWayTiles = [];
-
-  const unvisited = new Set(W.spawnTiles.map(t => `${t.x},${t.y}`));
   W.spawnAreas = [];
-
-  for (const t of W.spawnTiles) {
-    const k = `${t.x},${t.y}`;
-    if (!unvisited.has(k)) continue;
-
-    const cluster = [];
-    const queue = [t];
-    unvisited.delete(k);
-
-    while (queue.length > 0) {
-      const curr = queue.shift();
-      cluster.push(curr);
-
-      // Check all 8 surrounding tiles to see if they are part of this spawn zone
-      const dirs = [[0,1], [0,-1], [1,0], [-1,0], [1,1], [1,-1], [-1,1], [-1,-1]];
-      for (const [dx, dy] of dirs) {
-        const nk = `${curr.x + dx},${curr.y + dy}`;
-        if (unvisited.has(nk)) {
-          unvisited.delete(nk);
-          queue.push({x: curr.x + dx, y: curr.y + dy});
-        }
-      }
-    }
-    W.spawnAreas.push(cluster);
-  }
 
   for (const t of W.tiles.values()) {
     if (isSpawnTile(t)) {
@@ -110,6 +90,37 @@ export function syncCaches() {
     if (t.oneWay) {
       W.oneWayTiles.push({ x: t.x, y: t.y, dir: t.oneWay });
     }
+  }
+
+  const unvisited = new Set(W.spawnTiles.map(t => `${t.x},${t.y}`));
+
+  for (const t of W.spawnTiles) {
+    const k = `${t.x},${t.y}`;
+    if (!unvisited.has(k)) continue;
+
+    const cluster = [];
+    const queue = [t];
+    unvisited.delete(k);
+
+    while (queue.length > 0) {
+      const curr = queue.shift();
+      cluster.push(curr);
+
+      const dirs = [
+        [0, 1], [0, -1], [1, 0], [-1, 0],
+        [1, 1], [1, -1], [-1, 1], [-1, -1]
+      ];
+
+      for (const [dx, dy] of dirs) {
+        const nk = `${curr.x + dx},${curr.y + dy}`;
+        if (unvisited.has(nk)) {
+          unvisited.delete(nk);
+          queue.push({ x: curr.x + dx, y: curr.y + dy });
+        }
+      }
+    }
+
+    W.spawnAreas.push(cluster);
   }
 
   const now = Date.now();

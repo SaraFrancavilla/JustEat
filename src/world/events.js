@@ -3,8 +3,6 @@ import { W, syncCaches } from "./state.js";
 import { setTile, normalizeTileArgs } from "./tiles.js";
 import { key, R } from "../utils/math.js";
 import { debug } from "../config.js";
-import { LLMCoordinationAgent } from "../llm/agent.mjs";
-import { analyzeMapStrategyWithLLM } from "./mapAnalysis.js";
 import { rebuildBoxPositionsFromTiles } from "./helpers.js";
 
 function syncSingleTileCrateState(x, y) {
@@ -16,7 +14,15 @@ function syncSingleTileCrateState(x, y) {
   else W.boxPos.delete(k);
 }
 
-client.onYou(me => {
+function markServerAck(reason) {
+  if (W.prevActionFinished === false) {
+    W.prevActionFinished = true;
+    debug("[ACK] prevActionFinished <- true via", reason);
+  }
+}
+
+client.onYou((me) => {
+  const prevMe = W.me ? { ...W.me } : null;
   W.me = { ...me };
 
   const k = key(R(me.x), R(me.y));
@@ -24,13 +30,18 @@ client.onYou(me => {
     setTile(me.x, me.y, "3", false);
   }
 
-  debug("Position", me.x, me.y);
+  markServerAck("onYou");
+  debug("Position", me.x, me.y, "prev", prevMe?.x, prevMe?.y);
 });
 
-client.onTile(tile => {
+client.onTile((tile) => {
   const { x, y, type } = normalizeTileArgs(tile);
   setTile(x, y, type, false);
   syncSingleTileCrateState(x, y);
+
+  if (W.boxPos?.size > 0) {
+    markServerAck("onTile");
+  }
 });
 
 client.onMap((width, height, tiles) => {
@@ -58,11 +69,9 @@ client.onMap((width, height, tiles) => {
 
   rebuildBoxPositionsFromTiles();
   syncCaches();
-
-  analyzeMapStrategyWithLLM(LLMCoordinationAgent).catch(console.error);
 });
 
-client.onParcelsSensing(list => {
+client.onParcelsSensing((list) => {
   W.parcels.clear();
 
   for (const raw of list) {
@@ -81,13 +90,13 @@ client.onParcelsSensing(list => {
         x: Number(p.x),
         y: Number(p.y),
         reward: Number(p.reward ?? 0),
-        carriedBy: p.carriedBy ?? null
+        carriedBy: p.carriedBy ?? null,
       });
     }
   }
 });
 
-client.onAgentsSensing(list => {
+client.onAgentsSensing((list) => {
   W.agentPos.clear();
 
   for (const agent of list) {

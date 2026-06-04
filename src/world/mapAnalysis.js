@@ -1,6 +1,6 @@
 import { W } from "./state.js";
 import { key } from "../utils/math.js";
-import { runCoordinationCycle } from "../llm/agent.mjs";
+import { callModel } from "../llm/agent.mjs";
 
 // Basic helper to count walkable neighbors
 function countWalkableNeighbors(x, y) {
@@ -12,6 +12,24 @@ function countWalkableNeighbors(x, y) {
         if (tile && tile.walkable) count++;
     }
     return count;
+}
+
+export function isCrateMap() {
+  if (W.boxPos?.size > 0) return true;
+
+  for (const tile of W.tiles.values()) {
+    if (
+      tile?.hasCrate ||
+      tile?.crateTrack ||
+      tile?.crate ||
+      tile?.type === 5 ||
+      tile?.pushable
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export function computeMapProfile() {
@@ -36,54 +54,40 @@ export function computeMapProfile() {
     W.mapProfile = {
         walkableTiles: walkableCount,
         deliveryTiles: deliveryCount,
-        chokePointRatio: walkableCount > 0 ? (chokePoints / walkableCount).toFixed(2) : 0,
-        avgBranchingFactor: avgBranchingFactor.toFixed(2)
+        chokePointRatio: walkableCount > 0 ? Number((chokePoints / walkableCount).toFixed(2)) : 0,
+        avgBranchingFactor: Number(avgBranchingFactor.toFixed(2))
     };
 
     return W.mapProfile;
 }
 
-export async function analyzeMapStrategyWithLLM() {
-    const profile = computeMapProfile();
-    
-    const prompt = `
-    You are the Strategy Commander for a DeliverooJS agent. 
-    Analyze this map profile: ${JSON.stringify(profile)}.
-    
-    Map Types:
-    1. "Open" (Branching factor > 3.5).
-    2. "Hallways" (Branching factor < 2.5).
-    3. "Hub" (Mixed).
+export function classifyBaseMapType(avgBranchingFactor) {
+  const bf = Number(avgBranchingFactor ?? 3);
 
-    Carry Strategies:
-    - Target 4-5 parcels for Open Arenas.
-    - Target 1-2 parcels for Hallways (to avoid getting trapped).
+  if (bf > 3.5) return "Open";
+  if (bf < 2.5) return "Hallways";
+  return "Hub";
+}
 
-    You must output your decision inside a Final Answer block containing ONLY valid JSON.
-    
-    Format your response EXACTLY like this:
-    Thought: <your brief reasoning>
-    Final Answer: {"mapType": "...", "carryTarget": X}
-    `;
+export function classifyCarryTarget(baseType, hasCrates) {
+  if (baseType === "Open") return hasCrates ? 3 : 4;
+  if (baseType === "Hallways") return 1;
+  return hasCrates ? 2 : 3;
+}
 
-    try {
-        // Run cycle (5 iterations)
-        const response = await runCoordinationCycle(prompt, 5);
-        
-        if (response.success && response.answer) {
-            // Clean up the answer in case the LLM wrapped it in markdown code blocks
-            const cleanedAnswer = response.answer.replace(/```json/gi, "").replace(/```/g, "").trim();
-            
-            const strategy = JSON.parse(cleanedAnswer);
-            
-            if (strategy.carryTarget) {
-                W.strategy = strategy;
-                console.log("[STRATEGY] LLM set new strategy:", W.strategy);
-            }
-        } else {
-            console.log("[STRATEGY] Coordination cycle failed or timed out.");
-        }
-    } catch (e) {
-        console.error("[STRATEGY] Failed to parse LLM strategy:", e);
-    }
+export function computeStrategy() {
+  const profile = W.mapProfile ?? computeMapProfile();
+  const hasCrates = isCrateMap();
+  const baseType = classifyBaseMapType(profile.avgBranchingFactor, hasCrates);
+  const mapType = hasCrates ? `${baseType} with crates` : baseType;
+  const carryTarget = classifyCarryTarget(baseType, hasCrates);
+
+  W.strategy = {
+    mapType,
+    carryTarget,
+    baseType,
+    hasCrates,
+  };
+
+  return W.strategy;
 }
