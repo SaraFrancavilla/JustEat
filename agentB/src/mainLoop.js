@@ -197,6 +197,7 @@ function normalizeLLMPlan(plan, mission) {
   if (!plan) return null;
 
   if (["PICKUP", "DELIVER", "MOVE", "PATROL", "EXPLORE", "WAIT"].includes(plan.type)) {
+    console.log(`[LLM] Plan type: ${plan.type}, target: {x: ${plan.target?.x}, y: ${plan.target?.y}}`);
     return { type: plan.type, target: plan.target ?? null, source: "llm" };
   }
 
@@ -684,11 +685,21 @@ export async function tick() {
         return;
       }
 
+      //leftmost problem
+      const wasReplanningFailedTarget =
+        next.target &&
+        lastFailedTargetKey &&
+        targetKey(next.target) === lastFailedTargetKey;
+
       intention.type = next.type;
       intention.target = next.target ?? null;
       intention.steps = 0;
       intention.path = path;
-      clearTargetFailureMemory();
+      // clearTargetFailureMemory();ù
+      // Keep the failure counter when we are replanning the same target that just
+      // failed. Otherwise targetFails is reset to 1 forever and the delivery
+      // fallback/temporary blacklist never activates.
+      if (!wasReplanningFailedTarget) clearTargetFailureMemory();
     }
 
     if (intention.type === "DELIVER" && stillNeedsPickup) {

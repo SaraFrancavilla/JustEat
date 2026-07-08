@@ -383,6 +383,17 @@ export function currentMissionConstraints() {
     meetTarget: blocking?.policy?.meetTeammate?.target ?? null,
     meetRadius: blocking?.policy?.meetTeammate?.radius ?? null,
     handoffBonus: blocking?.policy?.handoffBonus ?? null,
+    //aggiunto ora per risolvere missione leftmost
+    dropRule:
+      blocking?.policy?.dropRule ??
+      missions.find((m) => canonicalObjectiveType(m?.objectiveType) === "drop_rule")?.policy?.dropRule ??
+      // If there's no explicit drop_rule mission, but some mission constrains delivery parcel score,
+      // synthesize a dropRule so downstream logic can treat it uniformly.
+      (() => {
+        const m = missions.find((m) => m?.policy?.delivery?.maxParcelScore != null);
+        if (m) return { maxParcelScore: m.policy.delivery.maxParcelScore, missionId: m.missionId ?? null };
+        return null;
+      })(),
   };
 }
 
@@ -507,7 +518,12 @@ export function completeDropRuleMissionsIfSatisfied(position = W.me, droppedCoun
     if (canonicalObjectiveType(mission?.objectiveType) !== "drop_rule") continue;
     if (mission?.kind !== "achievement_once") continue;
 
-    const targets = mission?.policy?.dropRule?.targetTiles ?? [];
+    // const targets = mission?.policy?.dropRule?.targetTiles ?? [];
+    const rule = mission?.policy?.dropRule ?? {};
+    //aggiunto per risolvere leftmost mission problem
+    const targets = Array.isArray(rule.targetTiles) && rule.targetTiles.length > 0 
+      ? rule.targetTiles
+      : deliveryTilesForRegion(rule.region);
     if (!Array.isArray(targets) || targets.length === 0) continue;
 
     const reached = targets.some(
@@ -1358,7 +1374,9 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
   }
 
   if (objectiveType === "drop_rule") {
-    const targetTiles =
+    // const targetTiles =
+    //to solve leftmost problem
+    const explicitTargetTiles =
       schema.targetTiles ??
       (schema.targetPosition
         ? [schema.targetPosition]
@@ -1368,6 +1386,15 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
             ? [{ x: Math.round(Number(W.me.x)), y: Math.round(Number(W.me.y)) }]
             : null
         ));
+
+    //to solve leftmost problem
+    const regionTiles = explicitTargetTiles?.length
+      ? explicitTargetTiles
+      : deliveryTilesForRegion(schema.region);
+    //to solve leftmost problem
+    const targetTiles = Array.isArray(regionTiles) && regionTiles.length > 0
+      ? regionTiles.map((t) => ({ x: Number(t.x), y: Number(t.y) }))
+      : null;
 
     mission.policy.dropRule = {
       region: schema.region ?? null,
@@ -1494,10 +1521,12 @@ export function addMission(collectionName, mission) {
     existing.kind = mission.kind;
     existing.policy = mission.policy;
     existing.expiresAt = mission.expiresAt ?? existing.expiresAt ?? null;
+    console.log('[MISSION] Updated existing mission in', collectionName, existing.signature, existing.policy);
     return existing;
   }
 
   arr.push(mission);
+  console.log('[MISSION] Added mission to', collectionName, mission.signature, mission.policy);
   return mission;
 }
 
@@ -1578,6 +1607,8 @@ export function getMissionPolicy() {
     maxAllowedParcelScore: constraints.maxAllowedParcelScore ?? null,
     meetTarget: constraints.meetTarget ?? null,
     meetRadius: constraints.meetRadius ?? null,
+    //leftmost problem
+    dropRule: constraints.dropRule ?? null,
     handoffBonus: constraints.handoffBonus ?? null,
   };
 }
@@ -1710,6 +1741,18 @@ export async function handleTrustedMissionMessage({
         mission.kind === "persistent_rule"
           ? addMission("activeRules", mission)
           : addMission("activeGoals", mission);
+
+      const receivedTarget = schema.targetPosition ?? schema.targetTiles ?? null;
+      const storedTarget =
+        storedMission?.policy?.moveTo?.target ??
+        storedMission?.policy?.dropRule?.targetTiles ??
+        storedMission?.policy?.delivery?.preferredTiles ??
+        null;
+
+      console.log("[MISSION] Target check:", JSON.stringify({
+        receivedTarget,
+        storedTarget,
+      }));
 
       console.log(
         mission.kind === "persistent_rule"

@@ -81,7 +81,7 @@ function allowsEntry(fromTile, toTile, dir) {
   if (!toTile) return false;
   if (!toTile.oneWay) return true;
 
-  if (dir === toTile.oneWay) return false;
+  if (dir === toTile.oneWay) return true;
 
   const opposite = {
     up: "down",
@@ -90,7 +90,7 @@ function allowsEntry(fromTile, toTile, dir) {
     right: "left",
   }[toTile.oneWay];
 
-  if (dir === opposite) return true;
+  if (dir === opposite) return false;
 
   return !!fromTile?.oneWay && fromTile.oneWay === toTile.oneWay;
 }

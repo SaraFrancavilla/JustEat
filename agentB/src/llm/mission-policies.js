@@ -66,23 +66,30 @@ function firstFinite(...values) {
 }
 
 function effectiveDeliveryRule(d = {}) {
-  const exactCount = Number.isFinite(d.exactCount) ? d.exactCount : null;
-  const minCount = Number.isFinite(d.minCount) ? d.minCount : null;
-  const maxCountExplicit = Number.isFinite(d.maxCount) ? d.maxCount : null;
-  const maxExclusiveCount = Number.isFinite(d.maxExclusiveCount) ? d.maxExclusiveCount : null;
-  const minExclusiveCount = Number.isFinite(d.minExclusiveCount) ? d.minExclusiveCount : null;
+  // const exactCount = Number.isFinite(d.exactCount) ? d.exactCount : null;
+  // const minCount = Number.isFinite(d.minCount) ? d.minCount : null;
+  // const maxCountExplicit = Number.isFinite(d.maxCount) ? d.maxCount : null;
+  // const maxExclusiveCount = Number.isFinite(d.maxExclusiveCount) ? d.maxExclusiveCount : null;
+  // const minExclusiveCount = Number.isFinite(d.minExclusiveCount) ? d.minExclusiveCount : null;
 
-  const exactIsReallyMax = Number.isFinite(exactCount) && !Number.isFinite(minCount) && !Number.isFinite(maxCountExplicit);
-  const maxCount = Number.isFinite(maxCountExplicit) ? maxCountExplicit : (exactIsReallyMax ? exactCount : null);
-  const exactForValidation = exactIsReallyMax ? null : exactCount;
+  // const exactIsReallyMax = Number.isFinite(exactCount) && !Number.isFinite(minCount) && !Number.isFinite(maxCountExplicit);
+  // const maxCount = Number.isFinite(maxCountExplicit) ? maxCountExplicit : (exactIsReallyMax ? exactCount : null);
+  // const exactForValidation = exactIsReallyMax ? null : exactCount;
 
+  const exactCount = Number.isFinite(d.exactCount) ? Number(d.exactCount) : null;
+  const minCount = Number.isFinite(d.minCount) ? Number(d.minCount) : null;
+  const maxCount = Number.isFinite(d.maxCount) ? Number(d.maxCount) : null;
+  const maxExclusiveCount = Number.isFinite(d.maxExclusiveCount) ? Number(d.maxExclusiveCount) : null;
+  const minExclusiveCount = Number.isFinite(d.minExclusiveCount) ? Number(d.minExclusiveCount) : null;
+ 
   return {
-    exactCount: exactForValidation,
+    // exactCount: exactForValidation,
+    exactCount,
     minCount,
     maxCount,
     minExclusiveCount,
     maxExclusiveCount,
-    exactIsReallyMax,
+    // exactIsReallyMax,
   };
 }
 
@@ -99,12 +106,31 @@ function countSatisfiesDeliveryRule(d, carriedCount) {
 
 function countCanStillBecomeValidByPickingUp(d, carriedCount) {
   if (!Number.isFinite(carriedCount)) return false;
+
   const eff = effectiveDeliveryRule(d);
-  if (Number.isFinite(eff.exactCount)) return carriedCount < eff.exactCount;
-  if (Number.isFinite(eff.minCount) && carriedCount < eff.minCount) return true;
-  if (Number.isFinite(eff.minExclusiveCount) && carriedCount <= eff.minExclusiveCount) return true;
-  if (Number.isFinite(eff.maxCount) && eff.maxCount > 0 && carriedCount === 0) return true;
-  if (Number.isFinite(eff.maxExclusiveCount) && eff.maxExclusiveCount > 1 && carriedCount === 0) return true;
+
+  // "exactly 3" è un obiettivo preferito, non un blocco assoluto.
+  // Se ho meno di 3 pacchi, provo a raccoglierne altri.
+  if (Number.isFinite(eff.exactCount)) {
+    return carriedCount < eff.exactCount;
+  }
+
+  if (Number.isFinite(eff.minCount)) {
+    return carriedCount < eff.minCount;
+  }
+
+  if (Number.isFinite(eff.minExclusiveCount)) {
+    return carriedCount <= eff.minExclusiveCount;
+  }
+
+  if (Number.isFinite(eff.maxCount)) {
+    return carriedCount < eff.maxCount;
+  }
+
+  if (Number.isFinite(eff.maxExclusiveCount)) {
+    return carriedCount < eff.maxExclusiveCount - 1;
+  }
+
   return false;
 }
 
@@ -153,12 +179,13 @@ export function normalizeMissionPolicy(mission = null) {
     pickup: {
       enabled: raw.avoidPickup ? false : (raw.pickup?.enabled ?? true),
       opportunisticOnly: !!raw.pickup?.opportunisticOnly,
-      exactCarry: Number.isFinite(raw.exactCarry)
-        ? raw.exactCarry
-        : (Number.isFinite(raw.pickup?.exactCarry) ? raw.pickup.exactCarry : null),
-      maxCarry: Number.isFinite(raw.pickup?.maxCarry)
-        ? raw.pickup.maxCarry
-        : (Number.isFinite(eff.maxCount) ? eff.maxCount : null),
+      exactCarry: (Number.isFinite(raw.exactCarry) && Number(raw.exactCarry) > 0)
+        ? Number(raw.exactCarry)
+        : (Number.isFinite(raw.pickup?.exactCarry) && Number(raw.pickup.exactCarry) > 0 ? Number(raw.pickup.exactCarry) : null),
+      // Treat zero or non-positive values as unspecified (null)
+      maxCarry: (Number.isFinite(raw.pickup?.maxCarry) && Number(raw.pickup.maxCarry) > 0)
+        ? Number(raw.pickup.maxCarry)
+        : (Number.isFinite(eff.maxCount) && Number(eff.maxCount) > 0 ? Number(eff.maxCount) : null),
       maxParcelScore: Number.isFinite(raw.pickup?.maxParcelScore)
         ? raw.pickup.maxParcelScore
         : (Number.isFinite(raw.delivery?.maxParcelScore) ? raw.delivery.maxParcelScore : null),

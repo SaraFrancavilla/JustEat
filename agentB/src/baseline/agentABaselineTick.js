@@ -128,13 +128,13 @@ async function tryReactiveFollowup(hint) {
   return didAnything;
 }
 
-export async function tickAgentABaseline() {
+export async function tickAgentABaseline(hint = null) {
   syncCaches();
   computeMapProfile();
   maybeStartStrategyAnalysis();
   updateSpatialMemory();
 
-  const hint = null;
+  // const hint = null;
 
   if (hint?.mode === "WAIT") {
     if (intention.type !== "WAIT") {

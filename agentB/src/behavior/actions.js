@@ -52,18 +52,36 @@ export function finishAction() {
 }
 
 export function canPickupNow(missionOrPolicy, carriedCount) {
-  if (!canIssueAction()) return false;
+  if (!canIssueAction()) {
+    console.debug('[ACTION] canPickupNow => blocked: cannot issue action (prevActionFinished=false)');
+    return false;
+  }
   const hardLimit = CFG.REACT_HARD_CARRY_LIMIT ?? 15;
-  if (carriedCount >= hardLimit) return false;
+  if (carriedCount >= hardLimit) {
+    console.debug('[ACTION] canPickupNow => blocked: reached hard carry limit', { carriedCount, hardLimit });
+    return false;
+  }
 
   if (missionOrPolicy == null) return true;
   const policy = normalizeMissionPolicy(missionOrPolicy);
-  if (policy?.wait?.mustWait) return false;
-  if (policy?.pickup?.enabled === false) return false;
-  
+  if (policy?.wait?.mustWait) {
+    console.debug('[ACTION] canPickupNow => blocked: mission wait active', { policy });
+    return false;
+  }
+  if (policy?.pickup?.enabled === false) {
+    console.debug('[ACTION] canPickupNow => blocked: pickup disabled by policy', { policy });
+    return false;
+  }
+
   // Enforce physical limits here, NOT delivery limits
-  if (Number.isFinite(policy?.pickup?.maxCarry) && carriedCount >= policy.pickup.maxCarry) return false;
-  if (Number.isFinite(policy?.pickup?.exactCarry) && carriedCount >= policy.pickup.exactCarry) return false;
+  if (Number.isFinite(policy?.pickup?.maxCarry) && carriedCount >= policy.pickup.maxCarry) {
+    console.debug('[ACTION] canPickupNow => blocked: reached mission maxCarry', { carriedCount, maxCarry: policy.pickup.maxCarry });
+    return false;
+  }
+  if (Number.isFinite(policy?.pickup?.exactCarry) && carriedCount >= policy.pickup.exactCarry) {
+    console.debug('[ACTION] canPickupNow => blocked: reached mission exactCarry', { carriedCount, exactCarry: policy.pickup.exactCarry });
+    return false;
+  }
 
   return true;
 }
@@ -145,6 +163,7 @@ export async function executeActionIntent(intent, missionOverride = undefined, m
     if (!canPickupNow(policy, carriedCountBeforePickup)) return false;
 
     const parcelsAtFeet = parcelsHere();
+    console.debug('[ACTION] Attempting PICKUP', { policy, carriedCountBeforePickup, parcelsAtFeetLength: parcelsAtFeet.length });
     if (!parcelsAtFeet.length) return false;
 
     markActionIssued();
@@ -182,8 +201,16 @@ export async function executeActionIntent(intent, missionOverride = undefined, m
   if (finalIntent.type === ActionType.PUTDOWN) {
     const carriedCountBeforeDrop = carryingCount();
     if (!canDeliverNow(policy, carriedCountBeforeDrop)) return false;
-
     const carriedSnapshotBeforeDrop = snapshotCarriedParcels();
+    // Enforce delivery parcel-score constraints before attempting putdown.
+    const d = policy?.delivery;
+    if (d && Number.isFinite(d.maxParcelScore)) {
+      const violating = carriedSnapshotBeforeDrop.find((p) => Number(p?.reward ?? 0) > d.maxParcelScore);
+      if (violating) {
+        console.debug('[ACTION] Blocking PUTDOWN => parcel exceeds delivery.maxParcelScore', { maxParcelScore: d.maxParcelScore, violatingParcel: violating });
+        return false;
+      }
+    }
     markActionIssued();
 
     let dropped = null;

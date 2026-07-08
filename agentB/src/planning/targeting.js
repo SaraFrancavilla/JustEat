@@ -67,6 +67,9 @@ function hasRealMissionConstraint(policy = null) {
   if ((policy?.delivery?.forbiddenTiles ?? []).length > 0) return true;
   if ((policy?.delivery?.zeroRewardTiles ?? []).length > 0) return true;
   if ((policy?.delivery?.multipliers ?? []).length > 0) return true;
+  //solve leftmost problem
+  if (policy?.meta?.dropRule?.region) return true;
+  if ((policy?.meta?.dropRule?.targetTiles ?? []).length > 0) return true;
   if ((policy?.movement?.avoidRules ?? []).length > 0) return true;
   if ((policy?.movement?.avoidTiles ?? []).length > 0) return true;
   if ((policy?.movement?.preferTiles ?? []).length > 0) return true;
@@ -221,6 +224,15 @@ function bestDeliveryTargetMission(policy, carried) {
     if (tileInList(z, policy?.delivery?.forbiddenTiles)) continue;
     if (isHardAvoidTile(z, avoidTiles, hardThreshold)) continue;
     if (!carriedSetCanBeDeliveredAtTarget(carried, z, policy)) continue;
+
+    // Do not keep selecting a mission delivery tile that the current pathfinder
+    // cannot reach. Without this guard the loop may replan the same bad target
+    // forever, especially on maps with narrow corridors or temporary blocks.
+    if (!samePos(W.me, z)) {
+      const path = planPathToTarget(z, { avoidTiles });
+      if (!Array.isArray(path) || path.length === 0) continue;
+    }
+
     const dist = manhattan(W.me.x, W.me.y, z.x, z.y);
     let score = -dist;
     if (tileInList(z, policy?.delivery?.preferredTiles)) score += 40;
@@ -281,10 +293,11 @@ function parcelReachabilityScore(parcel, path, policy = null, deliveryTarget = n
 }
 
 export function maxParcelScoreValue(policy) {
+  // Only consider an explicit pickup max parcel score when deciding
+  // whether a parcel is worth picking up. Delivery-only score caps
+  // should not block pickup decisions (they apply at drop time).
   const pickupMax = policy?.pickup?.maxParcelScore;
-  if (Number.isFinite(pickupMax)) return Number(pickupMax);
-  const deliveryMax = policy?.delivery?.maxParcelScore;
-  return Number.isFinite(deliveryMax) ? Number(deliveryMax) : null;
+  return Number.isFinite(pickupMax) ? Number(pickupMax) : null;
 }
 
 export function effectiveParcelReward(parcel, policy) {
@@ -680,8 +693,34 @@ function bestCoordinationTarget(policy, avoidTiles = []) {
   return null;
 }
 
+//solve leftmost problem
+function dropRuleTiles(policy) {
+  const rule = policy?.meta?.dropRule;
+  const explicit = rule?.targetTiles;
+  if (Array.isArray(explicit) && explicit.length > 0) return explicit;
+
+  const region = String(rule?.region ?? "").trim().toLowerCase();
+  const deliveryTiles = Array.isArray(W.deliveryTiles) ? W.deliveryTiles : [];
+  if (!region || deliveryTiles.length === 0) return [];
+
+  if (region.includes("leftmost") || region.includes("left-most")) {
+    const minX = Math.min(...deliveryTiles.map((t) => Number(t.x)));
+    return deliveryTiles.filter((t) => Number(t.x) === minX);
+  }
+
+  if (region.includes("rightmost") || region.includes("right-most")) {
+    const maxX = Math.max(...deliveryTiles.map((t) => Number(t.x)));
+    return deliveryTiles.filter((t) => Number(t.x) === maxX);
+  }
+
+  return [];
+}
+
+
 function dropRuleTarget(policy) {
-  const tiles = policy?.meta?.dropRule?.targetTiles;
+  // const tiles = policy?.meta?.dropRule?.targetTiles;
+  //leftmost problem
+  const tiles = dropRuleTiles(policy);
   if (!Array.isArray(tiles) || tiles.length === 0) return null;
   let best = null;
   let bestDist = Infinity;
@@ -689,6 +728,11 @@ function dropRuleTarget(policy) {
     const x = Number(t?.x);
     const y = Number(t?.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    //leftmost problem
+    if (!samePos(W.me, { x, y })) {
+      const path = planPathToTarget({ x, y }, { avoidTiles: policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? [] });
+      if (!Array.isArray(path) || path.length === 0) continue;
+    }
     const d = manhattan(W.me.x, W.me.y, x, y);
     if (d < bestDist) {
       bestDist = d;

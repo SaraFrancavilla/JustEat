@@ -1,4 +1,4 @@
-import "dotenv/config";
+import dotenv from "dotenv";
 import OpenAI from "openai";
 import { TOOLS, setSocket, coordination, resetCycleState } from "./tools.mjs";
 import { COORDINATION_SYSTEM_PROMPT } from "./prompts.mjs";
@@ -9,6 +9,8 @@ import {
   enqueueTrustedMissionMessage,
   processMissionQueue,
 } from "./missions.mjs";
+
+dotenv.config({ path: [".env.local", ".env"] });
 
 const baseURL = process.env.LLM_BASE_URL;
 const apiKey = process.env.LLM_API_KEY;

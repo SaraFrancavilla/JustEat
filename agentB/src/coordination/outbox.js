@@ -175,6 +175,9 @@ export function relayMissionPolicyToA() {
 
   const hint = {};
 
+  // Diagnostic: log movement hints to help debug coordinate mismatches
+  console.log("[OUTBOX] relayMissionPolicyToA: policy.moveTo=", policy.moveTo, "policy.meetTarget=", policy.meetTarget, "blockingSignature=", blocking?.signature ?? null);
+
   if (policy.mode === "WAIT") {
     hint.mode = "WAIT";
   }
@@ -193,7 +196,9 @@ export function relayMissionPolicyToA() {
   }
 
   if (policy.meetTarget) {
+    // Preferentially advertise explicit meetTarget, but also include it as a separate field
     hint.moveTo = policy.meetTarget;
+    hint.meetTarget = policy.meetTarget;
     hint.meetRadius = policy.meetRadius ?? 2;
   }
 

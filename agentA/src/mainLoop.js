@@ -217,7 +217,7 @@ function drainInboxHint() {
     }
 
     // LLM plan from B: normalize into an intent and attach to hint
-    if (msg.type === "llmplan" && msg.plan) {
+    if ((msg.type === "llmplan" || msg.type === "llm_plan") && msg.plan) {
       console.log("[A][LLM] Consuming plan from B:", JSON.stringify(msg.plan));
       const normalized = normalizeLLMPlan(msg.plan);
       if (normalized) {
@@ -270,6 +270,17 @@ export async function tick() {
     // Drain inbox and build coordination hint for this tick
     const hint = drainInboxHint();
 
+    // If a coordination hint contains an explicit rendezvous/moveTo, force a MOVE
+    // objective and ignore other behaviors until the target is reached.
+    let forcedMoveTarget = null;
+    if (hint && hint.mode !== "WAIT" && (hint.moveTo || hint.meetTarget)) {
+      const t = hint.moveTo ?? hint.meetTarget;
+      if (t && Number.isFinite(Number(t.x)) && Number.isFinite(Number(t.y))) {
+        forcedMoveTarget = { x: Number(t.x), y: Number(t.y) };
+        console.log("[A] Forced move target from hint:", forcedMoveTarget);
+      }
+    }
+
     // Wait override from B
     if (hint?.mode === "WAIT") {
       if (intention.type !== "WAIT") {
@@ -309,8 +320,13 @@ export async function tick() {
       }
     }
 
-    // Deliberation
-    let next = (await deliberate(hint)) ?? { type: "EXPLORE", target: null };
+    // Deliberation (unless a forced move target is present)
+    let next = null;
+    if (forcedMoveTarget) {
+      next = { type: "MOVE", target: forcedMoveTarget };
+    } else {
+      next = (await deliberate(hint)) ?? { type: "EXPLORE", target: null };
+    }
 
     // Opportunistic pickup override
     if (shouldPreferOpportunisticPickup(hint, next)) {
@@ -407,7 +423,7 @@ client.onMsg((id, name, msg, reply) => {
   const parsed = typeof msg === "object" ? msg : tryParseJSON(msg);
   if (!parsed) return;
 
-  if (parsed.type === "llmplan" && parsed.plan) {
+  if ((parsed.type === "llmplan" || parsed.type === "llm_plan") && parsed.plan) {
     console.log("[A] Received plan from B:", JSON.stringify(parsed.plan));
     pushPlanFromB(parsed.plan);
     return;
