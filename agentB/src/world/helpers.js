@@ -61,22 +61,6 @@ export function rebuildBoxPositionsFromTiles() {
   }
 }
 
-export function isWalkable(x, y, goalKey = null, boxSet = W.boxPos) {
-  const k = key(x, y);
-
-  if (!inKnownBounds(x, y)) return false;
-
-  const tile = W.tiles.get(k);
-  if (!tile) return false;
-  if (!tile.walkable) return false;
-
-  if (k !== goalKey && boxSet.has(k)) return false;
-  if (k !== goalKey && W.agentPos.has(k)) return false;
-  if (W.tempBlocked.has(k)) return false;
-
-  return true;
-}
-
 function allowsEntry(fromTile, toTile, dir) {
   if (!toTile) return false;
   if (!toTile.oneWay) return true;
@@ -110,7 +94,11 @@ export function canStep(fromX, fromY, dir, toX, toY, goalKey = null, boxSet = W.
   if (!allowsEntry(fromTile, toTile, dir)) return false;
 
   if (toK !== goalKey && boxSet.has(toK)) return false;
-  if (toK !== goalKey && W.agentPos.has(toK)) return false;
+  // don't exempt the goal tile from the agent-occupancy check here: A*
+  // calls canStep with the real goalKey, tryMoveDir() calls it with
+  // goalKey=null at execution time - exempting the goal let A* plan onto a
+  // teammate-occupied tile, then fail every tick until they moved away
+  if (W.agentPos.has(toK)) return false;
   if (W.tempBlocked.has(toK)) return false;
 
   return true;
