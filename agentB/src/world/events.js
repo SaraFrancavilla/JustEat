@@ -3,9 +3,9 @@ import {
   W,
   syncCaches,
   measureDecay,
-  measureSensorRadius,
   measureMovementDuration,
-  updateVisibleAgents
+  updateVisibleAgents,
+  updateKnownAgent
 } from "./state.js";
 import { setTile, normalizeTileArgs } from "./tiles.js";
 import { key, R } from "../utils/math.js";
@@ -32,6 +32,13 @@ client.onYou((me) => {
   const prevMe = W.me ? { ...W.me } : null;
   measureMovementDuration(me.x, me.y);
   W.me = { ...me };
+  // the only place a genuine, server-pushed position lands - distinct from
+  // W.me, which movement.js also writes to optimistically the instant a
+  // move's ack resolves, potentially a full tick or more before the next
+  // "you" event actually confirms the agent landed there. fine for routing
+  // (a tile early/late doesn't matter), not safe for a one-shot, exact-tile
+  // action like a drop_rule putdown - see reactive.js's onMissionDropTarget
+  W.lastServerPos = { x: Number(me.x), y: Number(me.y), at: Date.now() };
 
   const k = key(R(me.x), R(me.y));
   if (!W.tiles.has(k)) {
@@ -82,7 +89,6 @@ client.onMap((width, height, tiles) => {
 client.onParcelsSensing((list) => {
   W.parcels.clear();
   measureDecay(list);
-  measureSensorRadius(list.map(p => ({ x: Number(p.x), y: Number(p.y) })));
 
   for (const raw of list) {
     const p = raw?.parcel ?? raw;
@@ -106,9 +112,12 @@ client.onParcelsSensing((list) => {
   }
 });
 
+client.onAgentConnected((status, agent) => {
+  updateKnownAgent(status, agent);
+});
+
 client.onAgentsSensing((list) => {
   W.agentPos.clear();
-  measureSensorRadius(list.map(a => ({ x: Number(a.x), y: Number(a.y) })));
   updateVisibleAgents(list);
 
   for (const agent of list) {
