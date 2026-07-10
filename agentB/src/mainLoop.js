@@ -1,7 +1,7 @@
-import { W, visitedSpawns, syncCaches, intention, clearIntention } from "./world/state.js";
+import { W, visitedSpawns, syncCaches, intention, clearIntention, isTeammate } from "./world/state.js";
 import { isCrateMap, computeMapProfile, computeStrategy } from "./world/mapAnalysis.js";
 import { proposeReactiveAction } from "./behavior/reactive.js";
-import { executeActionIntent, waitAction, canDeliverNow } from "./behavior/actions.js";
+import { executeActionIntent, waitAction, canDeliverNow, executeHandoffDrop } from "./behavior/actions.js";
 import { fallbackMove, tryMoveDir } from "./behavior/movement.js";
 import {
   deliberate,
@@ -12,11 +12,12 @@ import {
   hasOpportunisticNearbyParcel,
   bestOpportunisticNearbyParcel,
   isMissionBlockingBaseline,
+  dropRuleTarget,
 } from "./planning/targeting.js";
 import { samePos, sameTarget } from "./utils/directions.js";
-import { blacklistGoal, carryingCount } from "./world/helpers.js";
-import { CFG } from "./config.js";
-import { key } from "./utils/math.js";
+import { blacklistGoal, carryingCount, carriedParcels, validGoal } from "./world/helpers.js";
+import { CFG, isTrustedSender } from "./config.js";
+import { key, manhattan } from "./utils/math.js";
 import {
   activeMissions,
   pruneExpiredMissions,
@@ -25,27 +26,23 @@ import {
   enqueueTrustedMissionMessage,
   completeWaitMissionsIfExpired,
   completeMoveToMissionsIfReached,
+  completeMeetTeammateMissionsIfSatisfied,
+  completeHandoffBonusMissionsIfSatisfied,
 } from "./llm/missions.mjs";
 import {
   normalizeMissionPolicy,
-  missionNeedsMorePickup,
+  deliveryPreferredCarryTarget,
+  deliveryRequiredCarryTarget,
   deliveryMustHappenNow,
 } from "./llm/mission-policies.js";
-import { callModel, runCoordinationCycle, LLMCoordinationAgent } from "./llm/agent.mjs";
+import { callModel, runCoordinationCycle } from "./llm/agent.mjs";
 import { coordination } from "./llm/tools.mjs";
-import { relayMissionPolicyToA } from "./coordination/outbox.js";
-import { invalidatePDDLCache } from "./planning/pddlPlanner.js";
+import { relayMissionPolicyToA, getTeammateId, sendPlanToA, setTeammateId, suppressClearConstraints } from "./coordination/outbox.js";
 import { tickAgentABaseline } from "./baseline/agentABaselineTick.js";
 import client from "./client.js";
 
 let busy = false;
-let llmAgent = null;
-let llmBusy = false;
 let missionQueueRunning = false;
-let tickCounter = 0;
-
-const LLM_COORDINATION_INTERVAL = 80;
-const LLM_COORDINATION_TYPES = new Set(["coordination", "multiagent"]);
 const SENSOR_RADIUS = 5;
 const DELIVERY_REPLAN_BEFORE_BLACKLIST = 4;
 const DELIVERY_STUCK_REPLAN_LIMIT = 3;
@@ -60,6 +57,7 @@ let lastStaleDeliverLogKey = null;
 let lastStaleDeliverLogAt = 0;
 let lastDeliveryStuckLogKey = null;
 let lastDeliveryStuckLogAt = 0;
+let lastNonBlockingMissionLogKey = null;
 
 function targetKey(target) {
   if (!target) return null;
@@ -116,25 +114,12 @@ function shouldRelaxFailureHandling() {
   return isCrateMap() && currentPlanLooksCrateSensitive();
 }
 
-function getLLMAgent() {
-  if (!llmAgent && W.me) llmAgent = new LLMCoordinationAgent(client);
-  return llmAgent;
-}
-
 function missionDeliveryCarryTarget(policy) {
-  const d = policy?.delivery ?? {};
-  const p = policy?.pickup ?? {};
-  if (Number.isFinite(p.exactCarry) && p.exactCarry > 0) return p.exactCarry;
-  if (Number.isFinite(d.exactCount) && d.exactCount > 0) return d.exactCount;
-  if (Number.isFinite(d.minCount) && d.minCount > 0) return d.minCount;
-  if (Number.isFinite(d.minExclusiveCount) && d.minExclusiveCount >= 0) return d.minExclusiveCount + 1;
-  if (Number.isFinite(d.maxCount) && d.maxCount > 0) return 1;
-  if (Number.isFinite(d.maxExclusiveCount) && d.maxExclusiveCount > 1) return 1;
-  return null;
+  return deliveryPreferredCarryTarget(policy);
 }
 
-function missionStillNeedsPickup(policy) {
-  return missionNeedsMorePickup(policy, { carriedCount: carryingCount() });
+function missionRequiredCarryTarget(policy) {
+  return deliveryRequiredCarryTarget(policy);
 }
 
 function missionMustDeliverBeforePickup(policy) {
@@ -155,8 +140,9 @@ function shouldPreferOpportunisticPickup(mission, next = null) {
   if (!next) return false;
   if (!["DELIVER", "EXPLORE", "PATROL", "MOVE"].includes(next.type)) return false;
 
+  // pickupAllowed already enforces upper bounds; floor-only missions can stay opportunistic
   if (isMissionBlockingBaseline(mission)) {
-    return hasOpportunisticNearbyParcel(mission) && missionStillNeedsPickup(policy);
+    return hasOpportunisticNearbyParcel(mission);
   }
 
   if (carried >= (CFG.REACT_HARD_CARRY_LIMIT ?? 15)) return false;
@@ -183,7 +169,6 @@ function ensureMissionPlanConsistency(mission) {
 
   if (changed) {
     clearIntention();
-    invalidatePDDLCache?.();
     W.lastMissionId = missionId;
     W.lastMissionSignature = missionSignature;
     console.log("[MISSION] Cleared previous intention for mission replanning.", missionId);
@@ -203,7 +188,7 @@ function normalizeLLMPlan(plan, mission) {
 
   if (!plan.objective) return null;
 
-  if (plan.objective === "collectparcel") {
+  if (plan.objective === "collect_parcel") {
     const target = plan.targetPosition
       ? { x: Number(plan.targetPosition.x), y: Number(plan.targetPosition.y) }
       : null;
@@ -217,7 +202,7 @@ function normalizeLLMPlan(plan, mission) {
     return { type: "PICKUP", target, source: "llm" };
   }
 
-  if (plan.objective === "delivernow") {
+  if (plan.objective === "deliver_now") {
     const target = plan.targetPosition
       ? { x: Number(plan.targetPosition.x), y: Number(plan.targetPosition.y) }
       : null;
@@ -235,7 +220,7 @@ function normalizeLLMPlan(plan, mission) {
       : { type: "EXPLORE", target: null, source: "llm" };
   }
 
-  if (plan.objective === "moveto") {
+  if (plan.objective === "move_to") {
     const target = plan.targetPosition
       ? { x: Number(plan.targetPosition.x), y: Number(plan.targetPosition.y) }
       : null;
@@ -252,7 +237,7 @@ function consumeLLMPlan(mission) {
 
   while (coordination.pendingMessages.length > 0) {
     const msg = coordination.pendingMessages.shift();
-    if (msg?.type !== "llmplan") continue;
+    if (msg?.type !== "llm_plan") continue;
     console.log("[LLM] Received plan from tool:", JSON.stringify(msg.plan));
     const normalized = normalizeLLMPlan(msg.plan, mission);
     if (!normalized) continue;
@@ -280,54 +265,13 @@ function maybeStartStrategyAnalysis() {
   lastBranchingFactor = currentBF;
 }
 
-function maybeTriggerLLMCoordination(mission) {
-  const policy = normalizeMissionPolicy(mission);
-  if (!W.me || llmBusy || W.missionEvaluating || policy?.wait?.mustWait) return;
-
-  const active = [...(W.activeGoals ?? []), ...(W.activeRules ?? [])]
-    .filter((m) => m?.accepted && m?.status === "active");
-  if (active.length === 0) return;
-
-  const needsLLM = active.some(
-    (m) => LLM_COORDINATION_TYPES.has(m?.objectiveType) && m?.policy?.requiresCoordination === true
-  );
-  if (!needsLLM) return;
-
-  tickCounter += 1;
-  if (tickCounter % LLM_COORDINATION_INTERVAL !== 0) return;
-
-  const agent = getLLMAgent();
-  if (!agent) return;
-
-  const missionTexts = active.map((m) => `- [${m.kind}] ${m.text}`).join("\n");
-  const request = `You are coordinating overlapping or special missions in DeliverooJS. You must output EXACTLY ONE of the following formats:
-Action: sendplan_to_bdi
-Action Input: {"objective":"collectparcel","targetPosition":{"x":X,"y":Y}}
-Action: sendplan_to_bdi
-Action Input: {"objective":"delivernow","targetPosition":{"x":X,"y":Y}}
-Action: sendplan_to_bdi
-Action Input: {"objective":"explore"}
-Final Answer: NO_SAFE_PLAN
-
-Current position: (${W.me.x}, ${W.me.y})
-Carrying: ${W.carrying?.size ?? 0}
-Active missions:
-${missionTexts}`.trim();
-
-  llmBusy = true;
-  console.log("[LLM] Waking up Mission Strategist. Missions active:", active.length);
-  agent.coordinate(request)
-    .catch((err) => console.error("[LLM] coordination error", err))
-    .finally(() => { llmBusy = false; });
-}
-
 function arbitratePlannedIntent(next, mission) {
   if (!next) return { type: "EXPLORE", target: null };
 
   const policy = normalizeMissionPolicy(mission);
   const missionBlocksBaseline = isMissionBlockingBaseline(mission);
   const carried = carryingCount();
-  const carryTarget = missionDeliveryCarryTarget(policy);
+  const carryTarget = missionRequiredCarryTarget(policy);
   const stillNeedsPickup = Number.isFinite(carryTarget) && carried < carryTarget;
   const mustDeliverNow = missionMustDeliverBeforePickup(policy);
 
@@ -404,7 +348,16 @@ function arbitratePlannedIntent(next, mission) {
   return next;
 }
 
-async function tryReactiveFollowup(mission) {
+// suppressOpportunistic freezes this entirely during an active coordination/
+// handoff MOVE - proposeReactiveAction()/canPickupNow()/canDeliverNow() have
+// no way to know "B is mid-coordination-move" on their own (that state lives
+// only in mainLoop.js's local coordinationIntent/handoffIntent, not in the
+// mission policy they read), so without this B would reactively pick up and
+// deliver ordinary parcels while walking to a meet/traffic-light/handoff
+// target, directly contradicting the "focus on the mission" behavior already
+// enforced everywhere else in this tick
+async function tryReactiveFollowup(mission, suppressOpportunistic = false) {
+  if (suppressOpportunistic) return false;
   let didAnything = false;
   for (let i = 0; i < 4; i += 1) {
     const intentNow = proposeReactiveAction(mission);
@@ -413,6 +366,23 @@ async function tryReactiveFollowup(mission) {
     if (!ok) break;
     didAnything = true;
     syncCaches();
+
+    // a reactive PICKUP just above can flip carrying from 0 to >0 mid-loop.
+    // suppressOpportunistic was computed once, by the caller, off the
+    // carrying count from BEFORE this pickup - it has no way to reflect
+    // that change, and the next loop iteration would call
+    // proposeReactiveAction() again still fully unsuppressed. for a
+    // drop_rule mission that meant reactively picking up a parcel and
+    // immediately delivering it again right where it stood, in the very
+    // same tick, without ever reaching deliberate()'s mission-focus routing
+    // to check whether it should be carried to the actual target tile
+    // instead - i.e. exactly how a mission target got skipped entirely.
+    // stop here once that's now the case and let the next tick's fresh
+    // focusedMissionMove computation (mainLoop.js's tick()) take over with
+    // an up-to-date carrying count
+    const policyNow = normalizeMissionPolicy(mission);
+    const dropTargetNow = carryingCount() > 0 ? dropRuleTarget(policyNow) : null;
+    if (dropTargetNow && !samePos(W.me, dropTargetNow)) break;
   }
   return didAnything;
 }
@@ -425,6 +395,297 @@ function updateSpatialMemory() {
       visitedSpawns.set(`${t.x},${t.y}`, now);
     }
   }
+}
+
+function nearTarget(target, radius = 0) {
+  if (!W.me || !target) return false;
+  return manhattan(W.me.x, W.me.y, target.x, target.y) <= Math.max(0, Number(radius ?? 0));
+}
+
+function teammateArrivedForMission(missionId) {
+  if (!missionId || !Array.isArray(W.coordinationStatuses)) return false;
+  return W.coordinationStatuses.some((s) =>
+    s?.missionId === missionId &&
+    ["arrived", "waiting"].includes(String(s?.status ?? ""))
+  );
+}
+
+// most recent position A reported as "arrived"/"waiting" for this mission -
+// A is stationary once waiting (see mainLoop.js's hint.mode==="WAIT"
+// branch), so this is a stable convergence target, not a moving one
+function latestTeammatePositionForMission(missionId) {
+  if (!missionId || !Array.isArray(W.coordinationStatuses)) return null;
+  for (let i = W.coordinationStatuses.length - 1; i >= 0; i--) {
+    const s = W.coordinationStatuses[i];
+    if (s?.missionId === missionId && ["arrived", "waiting"].includes(String(s?.status ?? "")) && s?.position) {
+      return { x: Number(s.position.x), y: Number(s.position.y) };
+    }
+  }
+  return null;
+}
+
+// finds the nearest reachable tile matching a row/column/parity spec -
+// each agent calls this independently on its own position, so they don't
+// need to agree on a single shared point (same idea as traffic_light_wait)
+function nearestRowColumnTile(spec, avoidTiles = []) {
+  if (!W.me || !W.tiles) return null;
+  const parity = spec?.rowParity ?? null;
+  const row = Number.isFinite(spec?.row) ? Number(spec.row) : null;
+  const column = Number.isFinite(spec?.column) ? Number(spec.column) : null;
+  if (!parity && row === null && column === null) return null;
+
+  let best = null;
+  let bestDist = Infinity;
+  for (const tile of W.tiles.values()) {
+    if (!tile || tile.walkable === false) continue;
+    const x = Number(tile.x);
+    const y = Number(tile.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+
+    if (parity) {
+      const isOdd = Math.abs(y % 2) === 1;
+      if (parity === "odd" && !isOdd) continue;
+      if (parity === "even" && isOdd) continue;
+    }
+    if (row !== null && y !== row) continue;
+    if (column !== null && x !== column) continue;
+
+    const target = { x, y };
+    const path = planPathToTarget(target, { avoidTiles });
+    if (!samePos(W.me, target) && (!Array.isArray(path) || path.length === 0)) continue;
+
+    const d = manhattan(W.me.x, W.me.y, target.x, target.y);
+    if (d < bestDist) {
+      bestDist = d;
+      best = target;
+    }
+  }
+  return best;
+}
+
+// "leftmost"/"rightmost" can't be pinned to a fixed column up front - the
+// known map is still being explored, so this re-scans W.tiles live each
+// call and naturally shifts further out as more of the map gets discovered
+function extremeKnownColumn(direction) {
+  if (!W.tiles) return null;
+  let extreme = null;
+  for (const tile of W.tiles.values()) {
+    if (!tile || tile.walkable === false) continue;
+    const x = Number(tile.x);
+    if (!Number.isFinite(x)) continue;
+    if (extreme === null || (direction === "rightmost" ? x > extreme : x < extreme)) extreme = x;
+  }
+  return extreme;
+}
+
+function nearestTrafficLightTile(trafficLight, avoidTiles = []) {
+  const row = Number.isFinite(trafficLight?.row) ? Number(trafficLight.row) : null;
+  let column = Number.isFinite(trafficLight?.column) ? Number(trafficLight.column) : null;
+  if (column === null && row === null && (trafficLight?.region === "leftmost" || trafficLight?.region === "rightmost")) {
+    column = extremeKnownColumn(trafficLight.region);
+  }
+  const spec =
+    row !== null || column !== null
+      ? { row, column }
+      : { rowParity: trafficLight?.rowParity ?? "odd" };
+  return nearestRowColumnTile(spec, avoidTiles);
+}
+
+let lastLoggedCoordinationMoveSig = null;
+function logCoordinationMoveOnce(target, radius) {
+  const sig = `${target.x},${target.y},${radius}`;
+  if (sig === lastLoggedCoordinationMoveSig) return;
+  lastLoggedCoordinationMoveSig = sig;
+  console.log("[B] Moving to coordination target:", target, "radius:", radius);
+}
+
+const COORDINATION_TARGET_INVALID_WARNING_DELAY_MS = 15000;
+let invalidCoordinationTargetSig = null;
+let invalidCoordinationTargetSince = 0;
+let warnedInvalidCoordinationTarget = false;
+
+// warn only after exploration has had time to reveal a coordination target
+function warnIfCoordinationTargetInvalid(target) {
+  const sig = `${target.x},${target.y}`;
+  if (validGoal(target)) {
+    if (invalidCoordinationTargetSig === sig) {
+      invalidCoordinationTargetSig = null;
+      invalidCoordinationTargetSince = 0;
+      warnedInvalidCoordinationTarget = false;
+    }
+    return;
+  }
+  if (invalidCoordinationTargetSig !== sig) {
+    invalidCoordinationTargetSig = sig;
+    invalidCoordinationTargetSince = Date.now();
+    warnedInvalidCoordinationTarget = false;
+    return;
+  }
+  if (!warnedInvalidCoordinationTarget && Date.now() - invalidCoordinationTargetSince > COORDINATION_TARGET_INVALID_WARNING_DELAY_MS) {
+    warnedInvalidCoordinationTarget = true;
+    console.warn(
+      "[B] Coordination target still isn't a known walkable tile after 15s - probably out of bounds or a wall, not just unexplored yet. Double-check the coordinates given in the mission:",
+      target
+    );
+  }
+}
+
+// shared rendezvous handling for meet_teammate and explicit traffic-light targets
+function meetTargetMoveOrWait(target, radius, missionId) {
+  const teammatePos = latestTeammatePositionForMission(missionId);
+  const effectiveTarget = teammatePos ?? target;
+  warnIfCoordinationTargetInvalid(effectiveTarget);
+
+  if (!nearTarget(effectiveTarget, radius)) {
+    // B's own coordination movement had no equivalent of A's "Forced move
+    // target" log - made it look like B wasn't doing anything toward a
+    // meet-up while it was actually converging correctly the whole time.
+    // logged on change only, not every tick, since this is checked every
+    // tick while approaching
+    logCoordinationMoveOnce(effectiveTarget, radius);
+    return {
+      type: "MOVE",
+      target: effectiveTarget,
+      source: teammatePos ? "coordination_move_to_teammate" : "coordination_move",
+    };
+  }
+  if (teammatePos || teammateArrivedForMission(missionId)) {
+    return { type: "WAIT", target: null, source: "coordination_wait_ready" };
+  }
+  return { type: "WAIT", target: null, source: "coordination_wait_teammate" };
+}
+
+function coordinationOverrideIntent(policy) {
+  const movement = policy?.movement ?? {};
+  const target = movement.meetTarget ?? movement.moveTo ?? null;
+  const radius = Number(movement.meetRadius ?? (movement.meetTarget ? 3 : 0));
+  const missionId = policy?.meta?.missionId ?? policy?.meta?.missionSignature ?? policy?.meta?.blockingText ?? null;
+
+  if (target) {
+    if (movement.meetTarget) {
+      return meetTargetMoveOrWait(target, radius, missionId);
+    }
+    // plain moveTo (no real "meet" semantics, e.g. a one-off relocation
+    // hint) - just get there and wait, no teammate-position refinement
+    if (!nearTarget(target, radius)) {
+      logCoordinationMoveOnce(target, radius);
+      return { type: "MOVE", target, source: "coordination_move" };
+    }
+    return { type: "WAIT", target: null, source: "coordination_wait_ready" };
+  }
+
+  if (Number.isFinite(movement.meetRow) || Number.isFinite(movement.meetColumn)) {
+    const rowColTarget = nearestRowColumnTile(
+      { row: movement.meetRow, column: movement.meetColumn },
+      movement.avoidRules ?? movement.avoidTiles ?? []
+    );
+    if (rowColTarget && !samePos(W.me, rowColTarget)) {
+      return { type: "MOVE", target: rowColTarget, source: "coordination_row_column" };
+    }
+    if (teammateArrivedForMission(missionId)) {
+      return { type: "WAIT", target: null, source: "coordination_wait_ready" };
+    }
+    return { type: "WAIT", target: null, source: "coordination_wait_teammate" };
+  }
+
+  const trafficLight = policy?.wait?.trafficLight;
+  if (trafficLight) {
+    if (trafficLight.target) {
+      // an explicit target/radius (e.g. "wait near (x,y) within N tiles of
+      // each other") takes the same meet-then-wait path as meet_teammate,
+      // instead of the row/column/parity tile search below - that search
+      // has no way to express "near a specific point", so without this the
+      // target/radius the LLM correctly extracted was silently discarded
+      // and each agent independently found its own unrelated "nearest odd
+      // row" tile, which is why they ended up far apart
+      const tlRadius = Math.max(0, Number(trafficLight.radius ?? 3));
+      return meetTargetMoveOrWait(trafficLight.target, tlRadius, missionId);
+    }
+    const parityTarget = nearestTrafficLightTile(
+      trafficLight,
+      policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? []
+    );
+    if (parityTarget && !samePos(W.me, parityTarget)) {
+      return { type: "MOVE", target: parityTarget, source: "traffic_light_row" };
+    }
+    return { type: "WAIT", target: null, source: "traffic_light_wait" };
+  }
+
+  return null;
+}
+
+// drop as soon as reasonably close instead of walking all the way to A -
+// B's own approach is pure decay overhead that never needed to happen; a
+// short radius here leaves the remaining distance (and decay budget) for
+// A's much shorter walk instead of burning it all on B's leg. kept tight
+// (not 0) since B/A positions are still only known to +-1 tick of latency -
+// requiring exact overlap could miss the window on the same tick it'd
+// otherwise trigger. tightened from 5 - on a vision-limited map A's walk
+// to the drop tile can take a long time (no shortcuts through unexplored
+// territory), and observed cases lost an entire parcel to decay purely
+// during that last stretch
+const HANDOFF_MEET_RADIUS = 2;
+const HANDOFF_BEACON_MAX_AGE_MS = 8000; // a bit more than agentA's 2s beacon interval
+const HANDOFF_RETRY_COOLDOWN_MS = 15000; // must be >= the pickup blacklist in executeHandoffDrop
+// a parcel already too decayed to survive even a short handoff trip isn't
+// worth attempting - deliver it normally instead and wait for a better one
+const HANDOFF_MIN_PARCEL_SCORE = 15;
+let activeHandoffParcelId = null;
+let handoffCooldownUntil = 0;
+
+// handoff_bonus only makes sense carrying exactly one parcel - putdown()
+// drops everything held at once. prefers agentA's live-sensed position but
+// falls back to its position beacon when sensing hasn't picked it up yet
+function handoffOverrideIntent(policy) {
+  if (!policy?.meta?.handoffBonus) {
+    activeHandoffParcelId = null;
+    return null;
+  }
+
+  if (Date.now() < handoffCooldownUntil) {
+    // a previous drop is still pending collection - starting a second
+    // handoff with a different parcel now would send agentA a brand new
+    // collect_parcel target and abandon whatever it was still walking
+    // toward, so nothing ever actually gets collected
+    return null;
+  }
+
+  const carried = carriedParcels();
+  if (carried.length !== 1) {
+    activeHandoffParcelId = null;
+    return null;
+  }
+
+  const parcel = carried[0];
+  const parcelId = String(parcel?.id ?? "");
+  if (!parcelId) return null;
+
+  if (Number(parcel?.reward ?? 0) < HANDOFF_MIN_PARCEL_SCORE) {
+    // too decayed/low-value to be worth chasing a teammate down for -
+    // just let normal delivery handle it
+    activeHandoffParcelId = null;
+    return null;
+  }
+
+  const teammateId = getTeammateId?.();
+  if (!teammateId) return null;
+
+  const sensed = W.agents?.get?.(teammateId);
+  const beacon = W.teammatePosition;
+  const beaconFresh = !!beacon && Date.now() - beacon.receivedAt < HANDOFF_BEACON_MAX_AGE_MS;
+  const teammate = sensed ?? (beaconFresh ? beacon : null);
+  if (!teammate) return null;
+
+  const dist = manhattan(W.me.x, W.me.y, teammate.x, teammate.y);
+
+  if (dist <= HANDOFF_MEET_RADIUS) {
+    activeHandoffParcelId = null;
+    return { type: "HANDOFF_DROP", target: null, source: "handoff_dropoff", parcel };
+  }
+
+  // required handoff mission: approach the known teammate once holding a parcel
+  activeHandoffParcelId = parcelId;
+  return { type: "MOVE", target: { x: teammate.x, y: teammate.y }, source: "handoff_approach" };
 }
 
 async function maybeProcessMissionQueue() {
@@ -453,7 +714,7 @@ function hasPendingMissionWork() {
 
 function maybeLogStaleDeliver(policy) {
   const carryingNow = carryingCount();
-  const carryTarget = missionDeliveryCarryTarget(policy);
+  const carryTarget = missionRequiredCarryTarget(policy);
   if (!Number.isFinite(carryTarget) || carryingNow >= carryTarget) return;
   const k = `${carryingNow}/${carryTarget}`;
   const now = Date.now();
@@ -471,10 +732,26 @@ function maybeLogDeliveryStuck(target, reason, extra = null) {
   const k = `${reason}:${targetKey(target)}`;
   const now = Date.now();
   if (k !== lastDeliveryStuckLogKey || now - lastDeliveryStuckLogAt > 1500) {
-    console.warn("[DELIVER] Replanning same delivery target.", { reason, target, ...(extra ?? {}) });
+    console.warn("[DELIVER] Delivery blocked.", { reason, target, ...(extra ?? {}) });
     lastDeliveryStuckLogKey = k;
     lastDeliveryStuckLogAt = now;
   }
+}
+
+// a maxParcelScore/maxTotalScore violation is a value problem, not a
+// positional one - the only fix is waiting for it to decay under the cap,
+// never a different tile or path
+function carriedBatchExceedsScoreCap(policy) {
+  const maxParcelScore = policy?.delivery?.maxParcelScore;
+  const maxTotalScore = policy?.delivery?.maxTotalScore;
+  if (!Number.isFinite(maxParcelScore) && !Number.isFinite(maxTotalScore)) return false;
+  const carried = carriedParcels();
+  if (Number.isFinite(maxParcelScore) && carried.some((p) => Number(p?.reward ?? 0) > maxParcelScore)) return true;
+  if (Number.isFinite(maxTotalScore)) {
+    const total = carried.reduce((s, p) => s + Number(p?.reward ?? 0), 0);
+    if (total > maxTotalScore) return true;
+  }
+  return false;
 }
 
 function setIntentToTarget(type, target, policy) {
@@ -530,7 +807,9 @@ export async function tick() {
         clearTargetFailureMemory();
         W.lastMissionId = null;
         W.lastMissionSignature = null;
-        invalidatePDDLCache?.();
+        // tell agentA to drop any coordination hint it was following, or
+        // it stays parked forever once B's last mission is archived
+        relayMissionPolicyToA?.();
       }
       await tickAgentABaseline();
       return;
@@ -544,10 +823,15 @@ export async function tick() {
     if (completeMoveToMissionsIfReached(W.me)) {
       clearIntention();
       clearTargetFailureMemory();
-      invalidatePDDLCache?.();
+    }
+
+    if (completeMeetTeammateMissionsIfSatisfied(W.me)) {
+      clearIntention();
+      clearTargetFailureMemory();
     }
 
     if (!hasActiveMissionRecords()) {
+      relayMissionPolicyToA?.();
       await tickAgentABaseline();
       return;
     }
@@ -565,11 +849,16 @@ export async function tick() {
       clearTargetFailureMemory();
       W.lastMissionId = null;
       W.lastMissionSignature = null;
-      invalidatePDDLCache?.();
+      relayMissionPolicyToA?.();
     }
 
     if (!missionBlocksBaseline) {
-      await tickAgentABaseline();
+      const missionKey = mission?.missionSignature ?? mission?.blockingText ?? JSON.stringify(mission ?? {});
+      if (missionKey !== lastNonBlockingMissionLogKey) {
+        console.log("[MISSION] Non-blocking rule active; using baseline strategy with action guards.");
+        lastNonBlockingMissionLogKey = missionKey;
+      }
+      await tickAgentABaseline(mission);
       return;
     }
 
@@ -584,14 +873,55 @@ export async function tick() {
         completeWaitMissionsIfExpired();
         clearIntention();
         clearTargetFailureMemory();
-        invalidatePDDLCache?.();
       } else {
         await executeActionIntent(waitAction("mission_wait"), controlMission);
       }
       return;
     }
 
-    const carryTarget = missionDeliveryCarryTarget(policy);
+    const coordinationIntent = coordinationOverrideIntent(policy);
+    if (coordinationIntent?.type === "WAIT") {
+      if (intention.type !== "WAIT") clearIntention();
+      intention.type = "WAIT";
+      intention.target = null;
+      intention.steps = 0;
+      intention.path = [];
+      await executeActionIntent(waitAction(coordinationIntent.source ?? "coordination_wait"), controlMission);
+      return;
+    }
+
+    // execute handoff drops directly; they are not path-planning intents
+    const handoffIntent = coordinationIntent ? null : handoffOverrideIntent(policy);
+    // once carrying for a drop_rule, keep focus on the mission target
+    const activeDropRuleTarget = carryingCount() > 0 ? dropRuleTarget(policy) : null;
+    // focused missions suppress opportunistic detours for this tick
+    const focusedMissionMove = coordinationIntent?.type === "MOVE" || handoffIntent?.type === "MOVE" || !!activeDropRuleTarget;
+    if (handoffIntent?.type === "HANDOFF_DROP") {
+      clearIntention();
+      const dropped = await executeHandoffDrop();
+      if (Array.isArray(dropped) && dropped.length > 0) {
+        handoffCooldownUntil = Date.now() + HANDOFF_RETRY_COOLDOWN_MS;
+        // keep A's collection hint active while the handoff can still succeed
+        suppressClearConstraints(HANDOFF_RETRY_COOLDOWN_MS);
+        // completion waits for A's confirmation, since a dropped parcel may vanish
+        const teammateId = getTeammateId?.();
+        if (teammateId) {
+          for (const p of dropped) {
+            sendPlanToA({
+              objective: "collect_parcel",
+              targetPosition: { x: Number(p.x), y: Number(p.y) },
+              targetParcelId: p.id,
+            });
+          }
+          console.log("[HANDOFF] Dropped for teammate and notified:", dropped.map((p) => p.id));
+        } else {
+          console.warn("[HANDOFF] Dropped parcel but no teammate id to notify - it will just sit there.");
+        }
+      }
+      return;
+    }
+
+    const carryTarget = missionRequiredCarryTarget(policy);
     const carryingNow = carryingCount();
     const stillNeedsPickup = Number.isFinite(carryTarget) && carryingNow < carryTarget;
 
@@ -613,7 +943,7 @@ export async function tick() {
       }
     }
 
-    if (await tryReactiveFollowup(controlMission)) {
+    if (await tryReactiveFollowup(controlMission, focusedMissionMove)) {
       clearTargetFailureMemory();
       clearIntention();
       syncCaches();
@@ -634,9 +964,17 @@ export async function tick() {
       if (shouldPreferOpportunisticPickup(controlMission, intention)) clearIntention();
     }
 
-    maybeTriggerLLMCoordination(controlMission);
     const llmNext = missionBlocksBaseline ? consumeLLMPlan(controlMission) : null;
-    let next = llmNext;
+    // (focusedMissionMove computed earlier, right after handoffIntent -
+    // opportunistic pickup below must not pre-empt an active coordination/
+    // handoff move; arbitratePlannedIntent passes a MOVE through unchanged,
+    // so this stays accurate after that call)
+    let next =
+      coordinationIntent?.type === "MOVE"
+        ? coordinationIntent
+        : handoffIntent?.type === "MOVE"
+        ? handoffIntent
+        : llmNext;
     if (!next) next = await deliberate(controlMission);
     next = arbitratePlannedIntent(next, controlMission) ?? { type: "WAIT", target: null };
 
@@ -645,9 +983,24 @@ export async function tick() {
       next = pickupPlan ?? { type: "EXPLORE", target: null, source: "delivery-guard" };
     }
 
-    if (!llmNext && shouldPreferOpportunisticPickup(controlMission, next)) {
+    if (!focusedMissionMove && !llmNext && shouldPreferOpportunisticPickup(controlMission, next)) {
       const pickupPlan = opportunisticPickupPlan(controlMission);
       if (pickupPlan) next = pickupPlan;
+    }
+
+    // deliberate() can itself decide to WAIT (e.g. still need parcels but
+    // nothing's visible, or the delivery target is briefly blocked). unlike
+    // the WAIT checks above, this one comes with a null target and would
+    // otherwise fall through to fallbackMove(null), which has no
+    // destination and just wanders off - intercept it the same way
+    if (next.type === "WAIT") {
+      if (intention.type !== "WAIT") clearIntention();
+      intention.type = "WAIT";
+      intention.target = null;
+      intention.steps = 0;
+      intention.path = [];
+      await executeActionIntent(waitAction(next.source ?? "deliberate_wait"), controlMission);
+      return;
     }
 
     const needNewPlan =
@@ -662,6 +1015,8 @@ export async function tick() {
       if (next.target) {
         path = planPathToTarget(next.target, {
           avoidTiles: policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? [],
+          // exact pathing handles rare coordination targets near one-way sections
+          exact: focusedMissionMove,
         }) ?? [];
       }
 
@@ -676,16 +1031,18 @@ export async function tick() {
             maybeLogDeliveryStuck(next.target, "no-path", { targetFails });
             clearIntention();
           }
+        } else if (focusedMissionMove) {
+          // coordination targets are not blacklisted while the map may be incomplete
+          clearIntention();
         } else {
           if (!isCrateMap()) blacklistGoal(next.target);
           clearIntention();
         }
         await fallbackMove(next.target ?? null);
-        await tryReactiveFollowup(controlMission);
+        await tryReactiveFollowup(controlMission, focusedMissionMove);
         return;
       }
 
-      //leftmost problem
       const wasReplanningFailedTarget =
         next.target &&
         lastFailedTargetKey &&
@@ -695,10 +1052,9 @@ export async function tick() {
       intention.target = next.target ?? null;
       intention.steps = 0;
       intention.path = path;
-      // clearTargetFailureMemory();ù
-      // Keep the failure counter when we are replanning the same target that just
-      // failed. Otherwise targetFails is reset to 1 forever and the delivery
-      // fallback/temporary blacklist never activates.
+      // keep the failure counter when replanning the same target that just
+      // failed, otherwise targetFails resets to 1 forever and the blacklist
+      // fallback never activates
       if (!wasReplanningFailedTarget) clearTargetFailureMemory();
     }
 
@@ -711,13 +1067,22 @@ export async function tick() {
 
     if (intention.target && samePos(W.me, intention.target)) {
       const reachedTarget = intention.target;
-      const didReactive = await tryReactiveFollowup(controlMission);
+      // lift suppression on the actual drop_rule target so putdown can run
+      const arrivedAtDropRuleTarget = !!(activeDropRuleTarget && samePos(reachedTarget, activeDropRuleTarget));
+      const didReactive = await tryReactiveFollowup(controlMission, focusedMissionMove && !arrivedAtDropRuleTarget);
 
       if (!didReactive) {
-        if (W.tiles.get?.(key(W.me.x, W.me.y))?.delivery && intention.type === "DELIVER") {
+        // drop_rule targets may be ordinary tiles, so retry failed putdowns there
+        const onRealDeliveryTile = !!W.tiles.get?.(key(W.me.x, W.me.y))?.delivery;
+        if ((onRealDeliveryTile || arrivedAtDropRuleTarget) && intention.type === "DELIVER") {
+          if (carriedBatchExceedsScoreCap(policy)) {
+            // stay on target and retry once the score cap is satisfied
+            maybeLogDeliveryStuck(intention.target, "waiting-for-score-decay");
+            return;
+          }
           const { targetFails } = registerTargetFailure(intention.target);
           if (targetFails >= DELIVERY_STUCK_REPLAN_LIMIT) {
-            console.warn("[DELIVER] Reached delivery tile repeatedly without successful putdown; blacklisting briefly.", intention.target);
+            console.warn("[DELIVER] Reached delivery/drop target repeatedly without successful putdown; blacklisting briefly.", intention.target);
             blacklistGoal(intention.target, 1500);
             clearIntention();
           } else {
@@ -751,8 +1116,13 @@ export async function tick() {
             maybeLogDeliveryStuck(intention.target, "step-failed", { targetFails });
             clearIntention();
           }
+          await tryReactiveFollowup(controlMission, focusedMissionMove);
+          return;
         } else if (shouldRelaxFailureHandling()) {
           clearIntention();
+        } else if (focusedMissionMove) {
+          // keep coordination targets eligible despite transient movement failures
+          intention.steps = 0;
         } else if (intention.target && targetFails >= 3) {
           blacklistGoal(intention.target);
           clearIntention();
@@ -760,23 +1130,22 @@ export async function tick() {
           intention.steps = 0;
         }
         await fallbackMove(intention.target);
-        await tryReactiveFollowup(controlMission);
+        await tryReactiveFollowup(controlMission, focusedMissionMove);
         return;
       }
     }
 
     clearTargetFailureMemory(intention.target);
-    await tryReactiveFollowup(controlMission);
+    await tryReactiveFollowup(controlMission, focusedMissionMove);
 
     if (completeMoveToMissionsIfReached(W.me)) {
       clearIntention();
       clearTargetFailureMemory();
-      invalidatePDDLCache?.();
       return;
     }
 
     await fallbackMove(next.target);
-    await tryReactiveFollowup(controlMission);
+    await tryReactiveFollowup(controlMission, focusedMissionMove);
   } catch (err) {
     console.error("[B] tick error", err);
   } finally {
@@ -784,16 +1153,62 @@ export async function tick() {
   }
 }
 
-const TRUSTED_SENDER_NAMES = new Set(["ChallengeGiver", "Professor"]);
-
+// trust is governed solely by isTrustedSender() (config.js), which reads
+// TRUSTED_SENDERS from env - don't duplicate the name list here, or setting
+// that env var stops working for this gate
 function isTrustedMissionSender(id, name) {
-  return TRUSTED_SENDER_NAMES.has(String(name));
+  return isTrustedSender(name);
 }
 
+// internal protocol messages are never mission text
+const INTERNAL_MESSAGE_TYPES = new Set(["position_beacon", "coordination_status", "llm_plan", "hint"]);
+
 client.onMsg(async (id, name, msg, reply) => {
-  console.log("[MSG]", id, name, msg, "hasReply", typeof reply === "function");
-  if (!isTrustedMissionSender(id, name)) {
-    console.log("[MSG] Message from untrusted sender ignored:", id, name);
+  const parsed = typeof msg === "object" ? msg : tryParseJSON(msg);
+
+  if (parsed?.type === "position_beacon" && parsed.position) {
+    // prefer roster-based teammate checks when available
+    const acceptable = W.knownAgents.has(id) ? isTeammate(id) : !isTrustedSender(name);
+    if (acceptable) {
+      // frequent beacon, used when normal sensing cannot see A
+      setTeammateId(id);
+      W.teammatePosition = {
+        x: Number(parsed.position.x),
+        y: Number(parsed.position.y),
+        receivedAt: Date.now(),
+      };
+    }
+    return;
+  }
+
+  if (parsed?.type === "coordination_status") {
+    if (!Array.isArray(W.coordinationStatuses)) W.coordinationStatuses = [];
+    W.coordinationStatuses.push({
+      ...parsed,
+      senderId: id,
+      senderName: name,
+      receivedAt: Date.now(),
+    });
+    W.coordinationStatuses = W.coordinationStatuses.slice(-20);
+    if (parsed.status === "collected") {
+      console.log("[HANDOFF] Teammate picked up the handed-off parcel:", parsed.targetParcelId);
+    } else if (parsed.status === "delivered") {
+      console.log("[HANDOFF] Teammate delivered the handed-off parcel - handoff fully complete:", parsed.targetParcelId);
+      // complete only after A confirms the handoff delivery
+      completeHandoffBonusMissionsIfSatisfied();
+    } else if (parsed.status === "missed") {
+      // retry promptly if A reached the drop tile after the parcel disappeared
+      console.log("[HANDOFF] Teammate found the parcel already gone - retrying handoff sooner:", parsed.targetParcelId);
+      handoffCooldownUntil = 0;
+      activeHandoffParcelId = null;
+    } else {
+      console.log("[COORD] Status from teammate:", JSON.stringify(parsed));
+    }
+    return;
+  }
+
+  // ignore internal protocol payloads before mission classification
+  if (parsed?.type && INTERNAL_MESSAGE_TYPES.has(parsed.type)) {
     return;
   }
 
@@ -805,6 +1220,13 @@ client.onMsg(async (id, name, msg, reply) => {
         ? msg.missionText
         : JSON.stringify(msg);
 
+  console.log(`[MSG] (${id}) ${name}: "${missionText}" hasReply ${typeof reply === "function"}`);
+
+  if (!isTrustedMissionSender(id, name)) {
+    console.log("[MSG] Message from untrusted sender ignored:", id, name);
+    return;
+  }
+
   enqueueTrustedMissionMessage({
     callModel,
     runCoordinationCycle,
@@ -815,3 +1237,7 @@ client.onMsg(async (id, name, msg, reply) => {
     socket: client.socket,
   });
 });
+
+function tryParseJSON(str) {
+  try { return JSON.parse(str); } catch { return null; }
+}
