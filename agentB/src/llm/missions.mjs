@@ -1,14 +1,5 @@
 import { W } from "../world/state.js";
 
-const TRUSTED_SENDERS = (process.env.TRUSTED_SENDERS || "ChallengeGiver,Professor")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-export function isTrustedSender(name) {
-  return TRUSTED_SENDERS.includes(String(name ?? "").trim());
-}
-
 export function missionSignature(text) {
   return String(text ?? "")
     .toLowerCase()
@@ -37,6 +28,21 @@ export function isMissionEndMessage(text) {
   );
 }
 
+// traffic-light waits are released only by explicit "go" signals
+export function isTrafficLightReleaseMessage(text) {
+  const t = String(text ?? "").toLowerCase();
+  return (
+    /\bgreen\s*light\b/.test(t) ||
+    /\blight('?s| is| turn(?:ed|s)?)?\s+green\b/.test(t) ||
+    /\bgo\s+ahead\b/.test(t) ||
+    /\byou\s+(?:can|may)\s+(?:go|move|proceed)\b/.test(t) ||
+    /\bproceed\b/.test(t) ||
+    /\bclear\s+to\s+(?:go|proceed|move)\b/.test(t) ||
+    /\ball\s+clear\b/.test(t) ||
+    /^\s*go\s*!?\s*$/.test(t)
+  );
+}
+
 function carryingCount() {
   return W.carrying?.size ?? 0;
 }
@@ -55,8 +61,7 @@ export function activeMissions() {
   );
 }
 
-// Normalises any variant (camelCase, no-separator, snake_case) -> snake_case canonical.
-// Only snake_case strings are used for all internal comparisons.
+// canonicalize objective names before internal comparisons
 function canonicalObjectiveType(type) {
   const t = String(type ?? "custom").trim().toLowerCase().replace(/_/g, "");
   const map = {
@@ -81,12 +86,14 @@ function canonicalObjectiveType(type) {
 function missionPriority(mission) {
   if (!mission) return -Infinity;
   const type = canonicalObjectiveType(mission?.objectiveType);
-  if (type === "wait")          return 100;
-  if (type === "deliver_rule")  return 80;
-  if (type === "pickup_rule")   return 75;
-  if (type === "meet_teammate") return 70;
-  if (type === "move_to")       return 60;
-  if (type === "avoid_tile")    return 50;
+  if (type === "wait")               return 100;
+  // coordination must take priority over ordinary count/value rules
+  if (type === "traffic_light_wait") return 95;
+  if (type === "meet_teammate")      return 90;
+  if (type === "deliver_rule")       return 80;
+  if (type === "pickup_rule")        return 75;
+  if (type === "move_to")            return 60;
+  if (type === "avoid_tile")         return 50;
   return 10;
 }
 
@@ -151,7 +158,7 @@ export function currentDeliverRuleMission() {
   })[0];
 }
 
-// Returns the active pickup_rule mission with the most restrictive cap (smallest maxCarry).
+// active pickup rule with the smallest carry cap
 export function currentPickupRuleMission() {
   const candidates = activeMissions().filter(
     (m) => canonicalObjectiveType(m?.objectiveType) === "pickup_rule"
@@ -169,26 +176,6 @@ export function currentMissionExactCount() {
   const mission = currentDeliverRuleMission();
   const exact = Number(mission?.policy?.delivery?.exactCount);
   return Number.isFinite(exact) && exact > 0 ? exact : null;
-}
-
-/**
- * Returns the effective carry target for the active deliver_rule mission,
- * considering exactCount, maxCount, maxExclusiveCount, and minCount in that priority order.
- * Falls back to strategy carryTarget when no mission is active.
- */
-export function currentCarryTarget() {
-  const mission = currentDeliverRuleMission();
-  if (mission) {
-    const d = mission?.policy?.delivery ?? {};
-    if (Number.isFinite(d.exactCount) && d.exactCount > 0) return d.exactCount;
-    if (Number.isFinite(d.maxCount) && d.maxCount > 0) return d.maxCount;
-    if (Number.isFinite(d.maxExclusiveCount) && d.maxExclusiveCount > 1)
-      return d.maxExclusiveCount - 1;
-    if (Number.isFinite(d.minCount) && d.minCount > 0) return d.minCount;
-    if (Number.isFinite(d.minExclusiveCount) && d.minExclusiveCount >= 0)
-      return d.minExclusiveCount + 1;
-  }
-  return Math.max(1, W.strategy?.carryTarget ?? 3);
 }
 
 export function missionNeedsMorePickup() {
@@ -212,10 +199,6 @@ export function currentBlockingMission() {
   return [...missions].sort((a, b) => missionPriority(b) - missionPriority(a))[0];
 }
 
-export function blockingMissionText() {
-  return currentBlockingMission()?.text ?? "None";
-}
-
 export function archiveMission(mission, finalStatus = "completed") {
   if (!mission || mission.status !== "active") return;
 
@@ -232,9 +215,11 @@ export function archiveMission(mission, finalStatus = "completed") {
 export function completeAllActiveMissions(reason = "cancelled") {
   for (const mission of activeGoals()) {
     archiveMission(mission, reason);
+    console.log(`[MISSION] Mission ${reason}:`, mission.text);
   }
   for (const mission of activeRules()) {
     archiveMission(mission, reason);
+    console.log(`[MISSION] Mission ${reason}:`, mission.text);
   }
 
   W.activeGoals = activeGoals().filter((m) => m?.status === "active");
@@ -249,6 +234,7 @@ export function pruneExpiredMissions() {
     const until = Number(mission?.policy?.wait?.until ?? mission?.expiresAt ?? 0);
     if (until && now >= until) {
       archiveMission(mission, "completed");
+      console.log("[MISSION] Expired mission completed:", mission.text);
     }
   }
 
@@ -257,6 +243,7 @@ export function pruneExpiredMissions() {
     const until = Number(mission?.policy?.wait?.until ?? mission?.expiresAt ?? 0);
     if (until && now >= until) {
       archiveMission(mission, "completed");
+      console.log("[MISSION] Expired mission completed:", mission.text);
     }
   }
 
@@ -320,6 +307,12 @@ export function currentMissionConstraints() {
   const minAllowedParcelScoreValues = missions
     .map((m) => Number(m?.policy?.delivery?.minParcelScore))
     .filter((n) => Number.isFinite(n));
+  const maxAllowedTotalScoreValues = missions
+    .map((m) => Number(m?.policy?.delivery?.maxTotalScore))
+    .filter((n) => Number.isFinite(n));
+  const minAllowedTotalScoreValues = missions
+    .map((m) => Number(m?.policy?.delivery?.minTotalScore))
+    .filter((n) => Number.isFinite(n));
 
   return {
     mustWait: missions.some((m) => canonicalObjectiveType(m?.objectiveType) === "wait"),
@@ -379,16 +372,27 @@ export function currentMissionConstraints() {
       minAllowedParcelScoreValues.length > 0
         ? Math.max(...minAllowedParcelScoreValues)
         : null,
+    maxAllowedTotalScore:
+      maxAllowedTotalScoreValues.length > 0
+        ? Math.min(...maxAllowedTotalScoreValues)
+        : null,
+    minAllowedTotalScore:
+      minAllowedTotalScoreValues.length > 0
+        ? Math.max(...minAllowedTotalScoreValues)
+        : null,
 
     meetTarget: blocking?.policy?.meetTeammate?.target ?? null,
     meetRadius: blocking?.policy?.meetTeammate?.radius ?? null,
-    handoffBonus: blocking?.policy?.handoffBonus ?? null,
-    //aggiunto ora per risolvere missione leftmost
+    meetRow: blocking?.policy?.meetTeammate?.row ?? null,
+    meetColumn: blocking?.policy?.meetTeammate?.column ?? null,
+    // handoff is opportunistic, so keep it visible beside blocking missions
+    handoffBonus:
+      missions.find((m) => canonicalObjectiveType(m?.objectiveType) === "handoff_bonus")?.policy?.handoffBonus ?? null,
+    // keep drop rules available even when another mission is blocking
     dropRule:
       blocking?.policy?.dropRule ??
       missions.find((m) => canonicalObjectiveType(m?.objectiveType) === "drop_rule")?.policy?.dropRule ??
-      // If there's no explicit drop_rule mission, but some mission constrains delivery parcel score,
-      // synthesize a dropRule so downstream logic can treat it uniformly.
+      // synthesize a drop rule for score-constrained delivery logic
       (() => {
         const m = missions.find((m) => m?.policy?.delivery?.maxParcelScore != null);
         if (m) return { maxParcelScore: m.policy.delivery.maxParcelScore, missionId: m.missionId ?? null };
@@ -435,7 +439,7 @@ export function completeDeliverRuleMissionsIfSatisfied(carriedCountBeforeDrop) {
     const d = mission?.policy?.delivery ?? {};
     const n = carriedCountBeforeDrop;
 
-    // persistent_rule missions stay active for the whole session
+    // persistent rules stay active for the whole session
     if (mission.kind === "persistent_rule") continue;
 
     const satisfied =
@@ -510,6 +514,63 @@ export function completeMoveToMissionsIfReached(position = W.me) {
   return completed;
 }
 
+// complete meet missions only after both agents are in range and A confirms
+export function completeMeetTeammateMissionsIfSatisfied(position = W.me) {
+  if (!position) return false;
+  let completed = false;
+
+  for (const mission of activeMissions()) {
+    if (canonicalObjectiveType(mission?.objectiveType) !== "meet_teammate") continue;
+    const meet = mission?.policy?.meetTeammate ?? null;
+    const target = meet?.target ?? null;
+    const row = Number.isFinite(meet?.row) ? Number(meet.row) : null;
+    const column = Number.isFinite(meet?.column) ? Number(meet.column) : null;
+    if (!target && row === null && column === null) continue;
+
+    const radius = Math.max(0, Number(meet?.radius ?? 3));
+
+    const teammateStatus = (W.coordinationStatuses ?? []).find(
+      (s) => s?.missionId === mission.id && ["arrived", "waiting"].includes(String(s?.status ?? ""))
+    );
+    if (!teammateStatus) continue;
+
+    if (target) {
+      const targetDx = Math.abs(Number(position.x) - Number(target.x));
+      const targetDy = Math.abs(Number(position.y) - Number(target.y));
+      const nearTarget = targetDx + targetDy <= radius;
+
+      // prefer pairwise distance; the shared target is only a rendezvous area
+      let nearTeammate = false;
+      if (teammateStatus.position) {
+        const pairDx = Math.abs(Number(position.x) - Number(teammateStatus.position.x));
+        const pairDy = Math.abs(Number(position.y) - Number(teammateStatus.position.y));
+        nearTeammate = pairDx + pairDy <= radius;
+      }
+
+      if (!nearTarget && !nearTeammate) continue;
+    } else {
+      // row/column missions require matching the row or column exactly
+      if (row !== null && Number(position.y) !== row) continue;
+      if (column !== null && Number(position.x) !== column) continue;
+    }
+
+    archiveMission(mission, "completed");
+    completed = true;
+    const where = target ? `(${Number(target.x)},${Number(target.y)})` : `row/column ${row ?? column}`;
+    console.log(
+      `[MISSION] Meet-teammate mission completed: both agents met around ${where} (${mission.text})`,
+      teammateStatus.position ? { me: position, teammate: teammateStatus.position } : ""
+    );
+  }
+
+  if (completed) {
+    W.activeGoals = activeGoals().filter((m) => m?.status === "active");
+    W.activeRules = activeRules().filter((m) => m?.status === "active");
+  }
+
+  return completed;
+}
+
 export function completeDropRuleMissionsIfSatisfied(position = W.me, droppedCount = 0) {
   if (!position || droppedCount <= 0) return false;
   let completed = false;
@@ -518,10 +579,8 @@ export function completeDropRuleMissionsIfSatisfied(position = W.me, droppedCoun
     if (canonicalObjectiveType(mission?.objectiveType) !== "drop_rule") continue;
     if (mission?.kind !== "achievement_once") continue;
 
-    // const targets = mission?.policy?.dropRule?.targetTiles ?? [];
     const rule = mission?.policy?.dropRule ?? {};
-    //aggiunto per risolvere leftmost mission problem
-    const targets = Array.isArray(rule.targetTiles) && rule.targetTiles.length > 0 
+    const targets = Array.isArray(rule.targetTiles) && rule.targetTiles.length > 0
       ? rule.targetTiles
       : deliveryTilesForRegion(rule.region);
     if (!Array.isArray(targets) || targets.length === 0) continue;
@@ -534,6 +593,27 @@ export function completeDropRuleMissionsIfSatisfied(position = W.me, droppedCoun
     archiveMission(mission, "completed");
     completed = true;
     console.log(`[MISSION] Drop mission completed: dropped ${droppedCount} parcel(s) at (${Number(position.x)},${Number(position.y)}) (${mission.text})`);
+  }
+
+  if (completed) {
+    W.activeGoals = activeGoals().filter((m) => m?.status === "active");
+    W.activeRules = activeRules().filter((m) => m?.status === "active");
+  }
+
+  return completed;
+}
+
+// one-time handoff missions complete after a confirmed handoff
+export function completeHandoffBonusMissionsIfSatisfied() {
+  let completed = false;
+
+  for (const mission of activeMissions()) {
+    if (canonicalObjectiveType(mission?.objectiveType) !== "handoff_bonus") continue;
+    if (mission?.kind !== "achievement_once") continue;
+
+    archiveMission(mission, "completed");
+    completed = true;
+    console.log(`[MISSION] Handoff mission completed: (${mission.text})`);
   }
 
   if (completed) {
@@ -618,6 +698,8 @@ function validateMissionSchema(obj) {
   const targetTiles = Array.isArray(obj.targetTiles)
     ? obj.targetTiles.map(normPos).filter(Boolean)
     : null;
+  const targetRow = toNonNegativeInt(obj.targetRow);
+  const targetColumn = toNonNegativeInt(obj.targetColumn);
   const rewardMultiplier = toNumber(obj.rewardMultiplier);
   const rewardOverride = toNumber(obj.rewardOverride);
   const valueThreshold = toNumber(obj.valueThreshold);
@@ -646,6 +728,8 @@ function validateMissionSchema(obj) {
     durationMs,
     targetPosition,
     targetTiles,
+    targetRow,
+    targetColumn,
     rewardMultiplier,
     rewardOverride,
     valueThreshold,
@@ -675,7 +759,7 @@ function repairMissionSchema(schema, missionText) {
     /\bmore\s+than\b|\bless\s+than\b/.test(text);
   const hasDeliverVerb = /\bdeliver\b|\bdrop\s+off\b/.test(text);
 
-  // pickup count rule repair
+  // pickup count-rule repair
   if (hasPickupVerb && hasCountPhrase && !hasDeliverVerb) {
     repaired.category = "rule";
     repaired.targetAction = "pickup";
@@ -699,7 +783,7 @@ function repairMissionSchema(schema, missionText) {
     }
   }
 
-  // delivery count rule repair
+  // delivery count-rule repair
   if (hasDeliverVerb && hasCountPhrase) {
     repaired.category = "rule";
     repaired.targetAction = "deliver";
@@ -778,6 +862,8 @@ SCHEMA
   "durationMs": number | null,
   "targetPosition": { "x": number, "y": number } | null,
   "targetTiles": [{ "x": number, "y": number }] | null,
+  "targetRow": number | null,
+  "targetColumn": number | null,
   "rewardMultiplier": number | null,
   "rewardOverride": number | null,
   "valueThreshold": number | null,
@@ -818,9 +904,25 @@ INTERPRETATION RULES
 - "Drop a package in the leftmost tile to get -10pt" => category "rule", objectiveType "drop_rule", targetAction "deliver", polarity "avoid", region "leftmost", scoreEffect { "type": "loss", "amount": 10, "per": "delivery" }.
 - "Every time you deliver in 4,7 or 8,2 you get 5x pts" => category "rule", objectiveType "delivery_zone_rule", targetAction "deliver", targetTiles [{ "x": 4, "y": 7 }, { "x": 8, "y": 2 }], rewardMultiplier 5.
 - "Every time you deliver in 4,7 you get 0 pts" => category "rule", objectiveType "delivery_zone_rule", targetAction "deliver", targetTiles [{ "x": 4, "y": 7 }], rewardOverride 0.
-- "Only deliver parcels with a score higher than 15, otherwise you get negative points" => category "rule", objectiveType "delivery_value_constraint", targetAction "deliver", valueThreshold 15, rewardMultiplier 0.
-- "If you deliver parcels with a score higher than 10, you get no reward" => category "rule", objectiveType "delivery_value_constraint", targetAction "deliver", valueThreshold 10, rewardMultiplier 0.
+- "Only deliver parcels with a score higher than 15, otherwise you get negative points" => category "rule", objectiveType "delivery_value_constraint", targetAction "deliver", valueThreshold 15, rewardMultiplier 0. This constrains EACH parcel individually.
+- "If you deliver parcels with a score higher than 10, you get no reward" => category "rule", objectiveType "delivery_value_constraint", targetAction "deliver", valueThreshold 10, rewardMultiplier 0. This constrains EACH parcel individually.
+- "Only deliver with a total score below 20" => category "rule", objectiveType "delivery_value_constraint", targetAction "deliver", valueThreshold 20, rewardMultiplier 0. The word "total" means this constrains the SUM of every parcel delivered together, not each parcel individually - a very different rule from the previous two examples.
 - "Do not go through tile 4,7 otherwise you lose 50 points" => category "rule", objectiveType "avoid_tile", polarity "avoid", targetTiles [{ "x": 4, "y": 7 }], scoreEffect { "type": "loss", "amount": 50, "per": null }.
+- "Move both agents to the neighborhood of position 4,7 within a maximum distance of 3, and have them wait for each other. You will receive 500pts." => category "goal", objectiveType "meet_teammate", targetPosition { "x": 4, "y": 7 }, radius 3, requiresCoordination true, scoreEffect { "type": "gain", "amount": 500, "per": null }.
+- "Go on row 10 with agent A" => category "goal", objectiveType "meet_teammate", targetRow 10, requiresCoordination true. Do NOT invent an x coordinate - only a row was given, so targetPosition stays null.
+- "Both agents move to column 5 and meet there" => category "goal", objectiveType "meet_teammate", targetColumn 5, requiresCoordination true.
+- Any instruction naming both/each agent, "with agent A/B", or "together" for a movement goal implies requiresCoordination true, even if the message never says "wait for each other".
+- "If a parcel is initially picked up by one agent and later delivered by the other agent, you will receive a 200 points bonus." => category "rule", objectiveType "handoff_bonus", requiresCoordination true, persistentUntilCancelled true, scoreEffect { "type": "gain", "amount": 200, "per": "delivery" }. This is phrased as a standing condition ("if... you will receive") that applies to every parcel for the rest of the match, so it is a persistent rule.
+- "Agent B hand off a parcel to agent A and agent A must deliver it" => category "goal", objectiveType "handoff_bonus", requiresCoordination true, persistentUntilCancelled false. This is a direct one-time instruction ("a parcel", singular, no "if"/"every time"/reward-per-occurrence framing) to do ONE handoff, not a standing rule that should keep firing for the rest of the match - use category "goal" (not "rule") for it, exactly like a one-time meet_teammate.
+- Any instruction where one agent picks up/hands off a parcel and the OTHER agent delivers it is handoff_bonus, never meet_teammate - meet_teammate is only for both agents converging on a shared point/row/column, it has nothing to do with transferring a parcel between them.
+- For handoff_bonus specifically: use persistentUntilCancelled true (category "rule") ONLY when the message describes a standing, repeatable condition - "if/whenever/every time a parcel is handed off, you get N points". Use persistentUntilCancelled false (category "goal") for a direct one-time command to hand off "a parcel" - the difference matters, since a rule keeps firing for every future handoff for the rest of the match, while a goal is satisfied and stops after the first one.
+- "All agents must move to an odd-numbered row and wait for our message before moving again, as in a red light green light game. 700 points bonus." => category "rule", objectiveType "traffic_light_wait", rowParity "odd", requiresCoordination true, persistentUntilCancelled true, scoreEffect { "type": "gain", "amount": 700, "per": null }.
+- "All agents must move to row 10 and wait for the green light" => category "rule", objectiveType "traffic_light_wait", targetRow 10, requiresCoordination true, persistentUntilCancelled true. This gives an EXACT row, not a parity - do not set rowParity, and do NOT invent an x coordinate.
+- Any exact row/column number given for a movement rule/goal must go in targetRow/targetColumn, never targetPosition - targetPosition is only for a full, explicit (x,y) pair.
+- "AgentB, for 50 points, move to the rightmost row and wait for the green light" => category "rule", objectiveType "traffic_light_wait", region "rightmost", requiresCoordination false, persistentUntilCancelled true, scoreEffect { "type": "gain", "amount": 50, "per": null }. Two things matter here: "rightmost"/"leftmost" is a map-edge region, not a row/column number or parity, so it goes in the region field. And the message names only "AgentB" specifically, never says "all agents" or "both agents" - so this applies to that one agent alone, requiresCoordination is false, and it must NOT be relayed to the other agent.
+- "Move to tile (11,21) to get 100 points and wait for the green light" => category "rule", objectiveType "traffic_light_wait", targetPosition { "x": 11, "y": 21 }, requiresCoordination false, persistentUntilCancelled true, scoreEffect { "type": "gain", "amount": 100, "per": null }. An explicit (x,y) point (not a row/column/parity/region) combined with a wait-for-signal clause is still traffic_light_wait - use targetPosition for the point. Do NOT classify this as plain move_to, which completes and releases the instant the tile is touched instead of actually waiting for the signal.
+- ANY movement instruction (to a point, row, column, or region) that also tells the agent to wait afterward is objectiveType "traffic_light_wait" with persistentUntilCancelled true, never plain "move_to" - regardless of the exact wording of the wait clause: "and wait", "then wait", "wait there", "wait for the green light", "wait for a signal", "wait for our message" all mean the same thing (arrive, then hold position instead of resuming normal play immediately). Only use "move_to" when there is no wait/hold clause at all.
+- If CURRENT STATE below shows an ACTIVE WAIT, this new message is very likely about releasing it, even when it doesn't literally say "green light" - judge it by meaning, not exact phrasing ("go ahead", "you're clear", "proceed now", "it's safe to move" all mean the same thing as a green light). If it plausibly signals the agent may resume moving, classify it as category "end" regardless of how it's worded. Only classify it as a new goal/rule instead if it clearly describes a distinct new instruction unrelated to ending the wait.
 - Quiz questions => category "quiz".
 - End/cancel messages => category "end".
 
@@ -868,12 +970,8 @@ function quickMissionRoute(text) {
     /\bquiz\b/.test(t) ||
     /\bquestion\b/.test(t);
 
-  const looksNegative =
-    /\blose\b/.test(t) ||
-    /\bpenalt(y|ies)?\b/.test(t) ||
-    /\bminus\s+\d+\b/.test(t) ||
-    /-\s*\d+\s*points?\b/.test(t) ||
-    /\byou\s+will\s+lose\b/.test(t);
+  const reward = classifyQuizReward(raw);
+  const looksNegative = reward.decision === "negative";
 
   if (looksLikeQuiz) {
     return {
@@ -920,6 +1018,48 @@ function parseQuickMathAnswer(text) {
   return null;
 }
 
+function classifyQuizReward(text) {
+  const t = String(text ?? "").toLowerCase();
+
+  const negativePatterns = [
+    /\bfor\s*-\s*\d+\b/,
+    /\bworth\s*-\s*\d+\b/,
+    /\b-\s*\d+\s*(?:pts?|points?)?\b/,
+    /\bminus\s+\d+\b/,
+    /\bnegative\s+\d+\b/,
+    /\blose\b/,
+    /\bloss\b/,
+    /\bpenalt(?:y|ies|ized|ise|ize)?\b/,
+    /\bdecreas(?:e|es|ed|ing)\b/,
+    /\bsubtract(?:s|ed|ing)?\b/,
+    /\btake\s+away\b/,
+    /\bcosts?\b/,
+    /\byou\s+will\s+lose\b/,
+  ];
+
+  const positivePatterns = [
+    /\bfor\s*\+?\s*\d+\b/,
+    /\bworth\s*\+?\s*\d+\b/,
+    /\b\+\s*\d+\s*(?:pts?|points?)?\b/,
+    /\bwin\s+\d+\b/,
+    /\bgain\s+\d+\b/,
+    /\bget\s+\d+\b/,
+    /\breceive\s+\d+\b/,
+    /\bearn\s+\d+\b/,
+    /\bbonus\b/,
+  ];
+
+  if (negativePatterns.some((re) => re.test(t))) {
+    return { decision: "negative", source: "local" };
+  }
+
+  if (positivePatterns.some((re) => re.test(t))) {
+    return { decision: "positive", source: "local" };
+  }
+
+  return { decision: "unknown", source: "local" };
+}
+
 function baseQuickSchema(overrides = {}) {
   return {
     category: "ignore",
@@ -935,6 +1075,8 @@ function baseQuickSchema(overrides = {}) {
     scoreEffect: null,
     targetPosition: null,
     targetTiles: null,
+    targetRow: null,
+    targetColumn: null,
     rewardMultiplier: null,
     rewardOverride: null,
     valueThreshold: null,
@@ -966,6 +1108,16 @@ function extractCoordinatePairs(text) {
   return out;
 }
 
+// true when the message addresses one specific agent by name ("AgentB,
+// move to...") rather than both ("all agents"/"both agents"/"each agent").
+// traffic_light_wait can legitimately be aimed at a single agent, unlike
+// meet_teammate/handoff_bonus which always need both regardless of wording
+function impliesSingleAgentAddressed(text) {
+  const namesOneAgent = /\bagent\s*[ab]\b/i.test(text);
+  const impliesAll = /\ball\s+agents?\b|\bboth\s+agents?\b|\beach\s+agent\b/i.test(text);
+  return namesOneAgent && !impliesAll;
+}
+
 function quickMissionSchema(rawText) {
   const raw = String(rawText ?? "").trim();
   const t = raw.toLowerCase();
@@ -976,6 +1128,15 @@ function quickMissionSchema(rawText) {
 
   // wait
   if (/\bwait\b/.test(t) && durationMs) {
+    const reward = classifyQuizReward(raw);
+    if (reward.decision === "negative") {
+      return baseQuickSchema({
+        category: "ignore",
+        confidence: 1,
+        explanation: "negative-wait-reward",
+      });
+    }
+
     return baseQuickSchema({
       category: "goal",
       objectiveType: "wait",
@@ -984,16 +1145,110 @@ function quickMissionSchema(rawText) {
     });
   }
 
-  // move_to
-  const moveMatch = t.match(
-    /\b(?:go|move|walk|reach)\s+(?:on|to|towards|at)?\s*(?:tile|position)?\s*\(?\s*(-?\d+)\s*,\s*(-?\d+)\s*\)?/i
-  );
+  // leave compound move-and-wait messages to the full classifier
+  const moveMatch = !/\bwait\b/.test(t)
+    ? t.match(
+        /\b(?:go|move|walk|reach)\s+(?:on|to|towards|at)?\s*(?:tile|position)?\s*\(?\s*(-?\d+)\s*,\s*(-?\d+)\s*\)?/i
+      )
+    : null;
   if (moveMatch) {
     return baseQuickSchema({
       category: "goal",
       objectiveType: "move_to",
       targetPosition: { x: Number(moveMatch[1]), y: Number(moveMatch[2]) },
       radius: 0,
+    });
+  }
+
+  // handoff_bonus: one agent picks up/hands off a parcel, the other
+  // delivers it - distinct from meet_teammate, which is about a shared
+  // point, not transferring a parcel. "if/whenever/every time... you get N
+  // points" is a standing rule; a direct command ("hand off a parcel") is
+  // a one-time goal, done after the first successful handoff
+  if (
+    /\bhand(?:s|ed)?[\s-]?off\b/i.test(t) ||
+    (/\b(?:one|other|each)\s+agent\b/i.test(t) && /\bpick(?:s|ed)?\s*up\b/i.test(t) && /\bdeliver/i.test(t))
+  ) {
+    const isOngoingRule =
+      /\bif\b/i.test(t) ||
+      /\bevery\s*time\b|\beach\s*time\b|\bwhenever\b/i.test(t) ||
+      /\bpoints?\s*bonus\b|\byou\s+will\s+receive\b|\byou(?:'ll| will)?\s+get\b/i.test(t);
+    return baseQuickSchema({
+      category: isOngoingRule ? "rule" : "goal",
+      objectiveType: "handoff_bonus",
+      requiresCoordination: true,
+      persistentUntilCancelled: isOngoingRule,
+    });
+  }
+
+  // meet_teammate: "Move both agents to the neighborhood of position (x,y)
+  // within a maximum distance of 3, and have them wait for each other."
+  if (/\bwait\s+for\s+each\s+other\b/.test(t) && coords.length > 0) {
+    const distanceMatch =
+      t.match(/\b(?:maximum\s+)?distance\s+of\s+(\d+)/i) ??
+      t.match(/\bwithin\s+(\d+)\b/i);
+    return baseQuickSchema({
+      category: "goal",
+      objectiveType: "meet_teammate",
+      targetPosition: coords[0],
+      radius: distanceMatch ? Number(distanceMatch[1]) : 3,
+      requiresCoordination: true,
+    });
+  }
+
+  // meet_teammate on an exact row/column: "Go on row 10 with agent A" -
+  // distinct from traffic_light_wait's odd/even parity below
+  const rowMatch = t.match(/\brow\s+(\d+)\b/i);
+  const columnMatch = t.match(/\bcolumn\s+(\d+)\b/i);
+  const impliesTeammate = /\bwith\s+agent\b|\btogether\b|\bboth\s+agents?\b|\beach\s+other\b/i.test(t);
+  if ((rowMatch || columnMatch) && impliesTeammate) {
+    return baseQuickSchema({
+      category: "goal",
+      objectiveType: "meet_teammate",
+      targetRow: rowMatch ? Number(rowMatch[1]) : null,
+      targetColumn: columnMatch ? Number(columnMatch[1]) : null,
+      requiresCoordination: true,
+    });
+  }
+
+  // traffic_light_wait: "All agents must move to an odd-numbered row and
+  // wait for our message before moving again, as in a red light green light game."
+  if (/\b(odd|even)[\s-]*numbered\s+row\b/i.test(t) && /\bwait\b/.test(t)) {
+    const parity = /\bodd\b/i.test(t) ? "odd" : "even";
+    return baseQuickSchema({
+      category: "rule",
+      objectiveType: "traffic_light_wait",
+      rowParity: parity,
+      requiresCoordination: !impliesSingleAgentAddressed(t),
+      persistentUntilCancelled: true,
+    });
+  }
+
+  // traffic_light_wait on an exact row/column: "All agents must move to
+  // row 10 and wait for the green light" - no "with agent"/"together"
+  // framing (that's the meet_teammate case above), just a plain freeze-in-place
+  if ((rowMatch || columnMatch) && /\bwait\b/.test(t)) {
+    return baseQuickSchema({
+      category: "rule",
+      objectiveType: "traffic_light_wait",
+      targetRow: rowMatch ? Number(rowMatch[1]) : null,
+      targetColumn: columnMatch ? Number(columnMatch[1]) : null,
+      requiresCoordination: !impliesSingleAgentAddressed(t),
+      persistentUntilCancelled: true,
+    });
+  }
+
+  // traffic_light_wait on a region edge: "move to the rightmost row and
+  // wait for the green light" - resolved against the known map live at
+  // execution time (see extremeKnownColumn in mainLoop.js), not here
+  const regionMatch = /\b(leftmost|left-most|rightmost|right-most)\b/i.test(t);
+  if (regionMatch && /\bwait\b/.test(t)) {
+    return baseQuickSchema({
+      category: "rule",
+      objectiveType: "traffic_light_wait",
+      region: /\bleft/i.test(t) ? "leftmost" : "rightmost",
+      requiresCoordination: !impliesSingleAgentAddressed(t),
+      persistentUntilCancelled: true,
     });
   }
 
@@ -1234,6 +1489,8 @@ export async function classifyMissionSchema({ callModel, missionText, currentSta
     scoreEffect: null,
     targetPosition: null,
     targetTiles: null,
+    targetRow: null,
+    targetColumn: null,
     rewardMultiplier: null,
     rewardOverride: null,
     valueThreshold: null,
@@ -1338,12 +1595,19 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
       Number.isFinite(schema.maxExclusiveCount)
     )
   ) {
+    const minCount = Number.isFinite(schema.minCount) ? schema.minCount : null;
+    const maxExclusiveCount =
+      Number.isFinite(schema.maxExclusiveCount) &&
+      !(Number.isFinite(minCount) && schema.maxExclusiveCount <= minCount)
+        ? schema.maxExclusiveCount
+        : null;
+
     mission.policy.delivery = {
       exactCount:        Number.isFinite(schema.exactCount)        ? schema.exactCount        : null,
-      minCount:          Number.isFinite(schema.minCount)          ? schema.minCount          : null,
+      minCount,
       maxCount:          Number.isFinite(schema.maxCount)          ? schema.maxCount          : null,
       minExclusiveCount: Number.isFinite(schema.minExclusiveCount) ? schema.minExclusiveCount : null,
-      maxExclusiveCount: Number.isFinite(schema.maxExclusiveCount) ? schema.maxExclusiveCount : null,
+      maxExclusiveCount,
       rewardMultiplier:  Number.isFinite(schema.rewardMultiplier)  ? schema.rewardMultiplier  : null,
     };
     // derive pickup carry cap from delivery constraint
@@ -1374,8 +1638,6 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
   }
 
   if (objectiveType === "drop_rule") {
-    // const targetTiles =
-    //to solve leftmost problem
     const explicitTargetTiles =
       schema.targetTiles ??
       (schema.targetPosition
@@ -1387,13 +1649,9 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
             : null
         ));
 
-    //to solve leftmost problem
-    const regionTiles = explicitTargetTiles?.length
-      ? explicitTargetTiles
-      : deliveryTilesForRegion(schema.region);
-    //to solve leftmost problem
-    const targetTiles = Array.isArray(regionTiles) && regionTiles.length > 0
-      ? regionTiles.map((t) => ({ x: Number(t.x), y: Number(t.y) }))
+    // resolve leftmost/rightmost delivery regions lazily as the map expands
+    const targetTiles = explicitTargetTiles?.length
+      ? explicitTargetTiles.map((t) => ({ x: Number(t.x), y: Number(t.y) }))
       : null;
 
     mission.policy.dropRule = {
@@ -1435,8 +1693,20 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
       /\b(?:higher|greater|above|over|at\s+least|minimum|min)\b/.test(text) &&
       (/\bonly\b/.test(text) || /\b(?:otherwise|negative|penalt|lose)\b/.test(text)) &&
       !/\bno\s+reward\b/.test(text);
+    // "only deliver with a score below 20" constrains each parcel
+    // individually, "...a total score below 20" constrains the sum - the
+    // former lets you deliver four 18-point parcels (72 total), the latter
+    // forbids it. detected from the original wording since it's independent
+    // of quick-regex vs full LLM parsing
+    const isTotalScope = /\btotal\b|\bcombined\b|\baltogether\b|\ball\s+together\b|\bsum\b/.test(text);
 
-    if (requiresHighValue) {
+    if (isTotalScope) {
+      if (requiresHighValue) {
+        mission.policy.delivery.minTotalScore = schema.valueThreshold;
+      } else {
+        mission.policy.delivery.maxTotalScore = schema.valueThreshold;
+      }
+    } else if (requiresHighValue) {
       mission.policy.delivery.minParcelScore = schema.valueThreshold;
     } else {
       mission.policy.delivery.maxParcelScore = schema.valueThreshold;
@@ -1463,6 +1733,8 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
   if (objectiveType === "meet_teammate") {
     mission.policy.meetTeammate = {
       target: schema.targetPosition ?? null,
+      row: Number.isFinite(schema.targetRow) ? schema.targetRow : null,
+      column: Number.isFinite(schema.targetColumn) ? schema.targetColumn : null,
       radius: Number.isFinite(schema.radius) ? schema.radius : 3,
       bonus: schema.scoreEffect?.amount ?? null,
       requiresCoordination: !!schema.requiresCoordination,
@@ -1477,8 +1749,29 @@ export function buildMissionRecordFromSchema(missionText, schema, now = Date.now
   }
 
   if (objectiveType === "traffic_light_wait") {
+    const row = Number.isFinite(schema.targetRow) ? schema.targetRow : null;
+    const column = Number.isFinite(schema.targetColumn) ? schema.targetColumn : null;
+    const regionRaw = String(schema.region ?? "").trim().toLowerCase();
+    // resolve leftmost/rightmost lazily against the explored map
+    const region =
+      regionRaw.includes("rightmost") || regionRaw.includes("right-most")
+        ? "rightmost"
+        : regionRaw.includes("leftmost") || regionRaw.includes("left-most")
+        ? "leftmost"
+        : null;
+    // explicit rendezvous points take priority over row/parity constraints
+    const target = schema.targetPosition ?? null;
+    // no radius means an exact tile, matching plain move_to semantics
+    const radius = target ? (Number.isFinite(schema.radius) ? schema.radius : 0) : null;
+    const hasExplicitTarget = !!target || row !== null || column !== null || !!region;
     mission.policy.trafficLight = {
-      rowParity: schema.rowParity ?? "odd",
+      // parity is only a fallback when no exact row/column/region is given
+      rowParity: !hasExplicitTarget ? (schema.rowParity ?? "odd") : (schema.rowParity ?? null),
+      row,
+      column,
+      region,
+      target,
+      radius,
       persistentUntilCancelled: !!schema.persistentUntilCancelled,
     };
   }
@@ -1538,7 +1831,7 @@ export function getMissionPolicy() {
   const exactDeliveryCount = constraints.exactDeliverCount;
   const carrying = W.carrying?.size ?? 0;
 
-  // needsMorePickup: true when the agent must accumulate more parcels before delivering
+  // true when the agent must collect more before delivering
   const needsMorePickup = (() => {
     if (Number.isFinite(exactDeliveryCount) && carrying < exactDeliveryCount) return true;
     const minC = constraints.minDeliverCount;
@@ -1552,7 +1845,7 @@ export function getMissionPolicy() {
     return false;
   })();
 
-  // forceDelivery: true when the agent MUST deliver now
+  // true when the agent must deliver now
   const forceDelivery = (() => {
     if (Number.isFinite(exactDeliveryCount) && carrying >= exactDeliveryCount) return true;
     const maxC = constraints.maxDeliverCount;
@@ -1562,7 +1855,7 @@ export function getMissionPolicy() {
     return false;
   })();
 
-  // Effective pickup cap: from deliver_rule OR pickup_rule, whichever is more restrictive
+  // strictest pickup cap across delivery and pickup rules
   const maxCarry = (() => {
     const deliverMission = currentDeliverRuleMission();
     const pickupMission = currentPickupRuleMission();
@@ -1576,11 +1869,17 @@ export function getMissionPolicy() {
     return Number.isFinite(effective) ? effective : null;
   })();
 
+  // coordination is checked across all active missions, not just the blocker
+  const coordinationRequired = activeMissions().some(
+    (m) => m?.policy?.requiresCoordination || m?.policy?.meetTeammate || m?.policy?.handoffBonus
+  );
+
   return {
     mode: waitAction?.type === "WAIT" ? "WAIT" : "NORMAL_PLAY",
     missionId: waitAction?.missionId ?? blocking?.id ?? null,
     missionSignature: blocking?.signature ?? null,
     blockingText: blocking?.text ?? "None",
+    coordinationRequired,
 
     avoidPickup: !!constraints.avoidPickup,
     avoidDelivery: !!constraints.avoidDelivery,
@@ -1605,9 +1904,12 @@ export function getMissionPolicy() {
     deliveryMultipliers: constraints.deliveryMultipliers ?? [],
     minAllowedParcelScore: constraints.minAllowedParcelScore ?? null,
     maxAllowedParcelScore: constraints.maxAllowedParcelScore ?? null,
+    minAllowedTotalScore: constraints.minAllowedTotalScore ?? null,
+    maxAllowedTotalScore: constraints.maxAllowedTotalScore ?? null,
     meetTarget: constraints.meetTarget ?? null,
     meetRadius: constraints.meetRadius ?? null,
-    //leftmost problem
+    meetRow: constraints.meetRow ?? null,
+    meetColumn: constraints.meetColumn ?? null,
     dropRule: constraints.dropRule ?? null,
     handoffBonus: constraints.handoffBonus ?? null,
   };
@@ -1617,10 +1919,84 @@ function shouldIgnoreQuizSchema(schema, missionText) {
   if (!schema || schema.category !== "quiz") return false;
   if (schema.scoreEffect?.type === "loss") return true;
 
-  const t = String(missionText ?? "").toLowerCase();
-  if (/\blose\b/.test(t) || /\bpenalt(y|ies)?\b/.test(t)) return true;
+  const reward = classifyQuizReward(missionText);
+  if (reward.decision === "negative") return true;
 
   return false;
+}
+
+function isUsefulAvoidanceSchema(schema) {
+  if (!schema) return false;
+  if (schema.polarity === "avoid") return true;
+  return [
+    "avoid_tile",
+    "avoid_pickup",
+    "avoid_delivery",
+    "delivery_value_constraint",
+  ].includes(canonicalObjectiveType(schema.objectiveType));
+}
+
+// movement commands with negative payoff are traps, not useful constraints
+const MOVEMENT_COMMAND_OBJECTIVE_TYPES = new Set(["move_to", "traffic_light_wait", "meet_teammate"]);
+
+function shouldIgnoreNegativeMissionSchema(schema, missionText) {
+  if (!schema || !(schema.category === "goal" || schema.category === "rule")) return false;
+  if (isUsefulAvoidanceSchema(schema)) return false;
+  // passive negative constraints are kept so the agent can avoid them
+  const isMovementCommand = MOVEMENT_COMMAND_OBJECTIVE_TYPES.has(canonicalObjectiveType(schema.objectiveType));
+  if (schema.category === "rule" && !isMovementCommand) return false;
+
+  const reward = classifyQuizReward(missionText);
+  if (reward.decision === "negative") return true;
+
+  if (schema.scoreEffect?.type === "loss") return true;
+
+  return false;
+}
+
+async function judgeQuizRewardWithLLM(callModel, missionText) {
+  const raw = await callModel(
+    [
+      {
+        role: "system",
+        content:
+          'You decide whether answering a DeliverooJS quiz is beneficial. Reply ONLY JSON: {"decision":"answer"|"ignore","reason":"short"}. Choose "answer" only if the prompt clearly gives positive reward for answering. Choose "ignore" for negative reward, penalties, cost, or unclear reward.',
+      },
+      {
+        role: "user",
+        content: `Quiz prompt: ${missionText}`,
+      },
+    ],
+    { temperature: 0 }
+  );
+
+  try {
+    const match = raw?.match(/\{[\s\S]*?\}/);
+    if (!match) return { decision: "ignore", reason: "no-json" };
+    const parsed = JSON.parse(match[0]);
+    return parsed?.decision === "answer"
+      ? { decision: "answer", reason: parsed.reason ?? "llm" }
+      : { decision: "ignore", reason: parsed?.reason ?? "llm" };
+  } catch {
+    return { decision: "ignore", reason: "parse-error" };
+  }
+}
+
+async function shouldAnswerQuiz(callModel, schema, missionText) {
+  if (!schema || schema.category !== "quiz") return false;
+  if (shouldIgnoreQuizSchema(schema, missionText)) return false;
+
+  const reward = classifyQuizReward(missionText);
+  if (reward.decision === "positive") return true;
+  if (reward.decision === "negative") return false;
+
+  const judged = await judgeQuizRewardWithLLM(callModel, missionText);
+  if (judged.decision !== "answer") {
+    console.log("[MISSION] Quiz ignored by reward judge:", judged.reason);
+    return false;
+  }
+
+  return true;
 }
 
 async function answerQuizFast(callModel, missionText, currentState) {
@@ -1689,6 +2065,7 @@ export function cancelMissionBySignature(signature) {
   for (const mission of [...activeGoals(), ...activeRules()]) {
     if (mission?.signature === signature) {
       archiveMission(mission, "cancelled");
+      console.log("[MISSION] Mission cancelled:", mission.text);
       break;
     }
   }
@@ -1706,7 +2083,14 @@ export async function handleTrustedMissionMessage({
 }) {
   pruneExpiredMissions();
 
-  const currentState = `Position: x=${W.me?.x}, y=${W.me?.y} | Score: ${W.me?.score}`;
+  // include active waits so the classifier can recognize release messages
+  const activeTrafficLightWaits = activeMissions().filter(
+    (m) => canonicalObjectiveType(m?.objectiveType) === "traffic_light_wait"
+  );
+  const activeWaitContext = activeTrafficLightWaits.length > 0
+    ? ` | ACTIVE WAIT (not yet released): "${activeTrafficLightWaits.map((m) => m.text).join('", "')}"`
+    : "";
+  const currentState = `Position: x=${W.me?.x}, y=${W.me?.y} | Score: ${W.me?.score}${activeWaitContext}`;
   const schema = await classifyMissionSchema({
     callModel,
     missionText,
@@ -1714,6 +2098,21 @@ export async function handleTrustedMissionMessage({
   });
 
   console.log("[MISSION] Interpreted schema:", schema);
+
+  // traffic-light waits end only on explicit release or cancellation
+  const releasedTrafficLight = isTrafficLightReleaseMessage(missionText)
+    ? activeMissions().filter(
+        (m) => canonicalObjectiveType(m?.objectiveType) === "traffic_light_wait"
+      )
+    : [];
+  if (releasedTrafficLight.length > 0) {
+    for (const mission of releasedTrafficLight) {
+      archiveMission(mission, "completed");
+      console.log("[MISSION] Traffic-light wait released by incoming message:", mission.text);
+    }
+    W.activeGoals = activeGoals().filter((m) => m?.status === "active");
+    W.activeRules = activeRules().filter((m) => m?.status === "active");
+  }
 
   if (schema.category === "end") {
     const active = activeMissions();
@@ -1734,6 +2133,11 @@ export async function handleTrustedMissionMessage({
   }
 
   if (schema.category === "rule" || schema.category === "goal") {
+    if (shouldIgnoreNegativeMissionSchema(schema, missionText)) {
+      console.log("[MISSION] Negative mission ignored:", missionText);
+      return;
+    }
+
     const mission = buildMissionRecordFromSchema(missionText, schema, Date.now());
 
     if (mission) {
@@ -1772,7 +2176,7 @@ export async function handleTrustedMissionMessage({
   }
 
   if (schema.category === "quiz") {
-    if (shouldIgnoreQuizSchema(schema, missionText)) {
+    if (!(await shouldAnswerQuiz(callModel, schema, missionText))) {
       console.log("[MISSION] Quiz ignored due to penalty/negative value.");
       return;
     }
