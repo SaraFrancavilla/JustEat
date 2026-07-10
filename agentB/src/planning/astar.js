@@ -175,7 +175,8 @@ function coreAStar(sx, sy, gx, gy, boxSet = W.boxPos, pathPolicy = null) {
   gScore.set(startK, 0);
 
   let expansions = 0;
-  const maxExpansions = CFG.ASTAR_MAX_EXPANSIONS ?? 4000;
+  // rare coordination or handoff queries can use a larger search budget
+  const maxExpansions = pathPolicy?.maxExpansions ?? (CFG.ASTAR_MAX_EXPANSIONS ?? 4000);
 
   while (!open.isEmpty() && expansions++ < maxExpansions) {
     const curr = open.pop();
@@ -195,11 +196,11 @@ function coreAStar(sx, sy, gx, gy, boxSet = W.boxPos, pathPolicy = null) {
       const ny = curr.y + d.dy;
       const nk = key(nx, ny);
 
-      // HARD AVOID
+      // hard avoid
       if (blockedSet?.has(nk) && nk !== goalK) continue;
       if (!canStep(curr.x, curr.y, d.dir, nx, ny, goalK, boxSet)) continue;
 
-      // SOFT AVOID PENALTY
+      // soft avoid penalty
       let moveCost = 1;
       if (penaltyMap?.has(nk)) {
         moveCost += penaltyMap.get(nk);
@@ -263,6 +264,7 @@ function crateAwareAStar(sx, sy, gx, gy, initialBoxSet = W.boxPos, pathPolicy = 
 
   let expansions = 0;
   const maxExpansions =
+    pathPolicy?.maxExpansions ??
     CFG.CRATE_ASTAR_MAX_EXPANSIONS ??
     Math.max((CFG.ASTAR_MAX_EXPANSIONS ?? 4000) * 3, 12000);
 
@@ -287,10 +289,10 @@ function crateAwareAStar(sx, sy, gx, gy, initialBoxSet = W.boxPos, pathPolicy = 
       const ny = curr.y + d.dy;
       const nk = key(nx, ny);
 
-      // HARD AVOID
+      // hard avoid
       if (blockedSet?.has(nk) && nk !== goalK) continue;
 
-      // SOFT AVOID PENALTY
+      // soft avoid penalty
       let moveCost = 1;
       if (penaltyMap?.has(nk)) {
         moveCost += penaltyMap.get(nk);
@@ -327,7 +329,7 @@ function crateAwareAStar(sx, sy, gx, gy, initialBoxSet = W.boxPos, pathPolicy = 
       const nextStateK = dynamicStateKey(nx, ny, nextBoxSet);
       const nextPushes = curr.pushes + 1;
       
-      // Add push penalty + soft avoid penalty
+      // add push cost plus any soft avoid penalty
       const ng = curr.g + moveCost + pushPenalty;
 
       if (ng < (gScore.get(nextStateK) ?? Infinity)) {
@@ -356,15 +358,84 @@ export function aStar(sx, sy, gx, gy, pathPolicy = null) {
   const rgx = R(gx);
   const rgy = R(gy);
 
-  // 1. Try normal A* first. We use W.boxPos because we don't push crates yet.
+  // try normal A* first
   const normalPath = coreAStar(rsx, rsy, rgx, rgy, W.boxPos, pathPolicy);
   if (normalPath !== null) return normalPath;
 
-  // 2. If normal A* failed, and there are crates on the map, try crate-aware A*
+  // if needed, retry with crate-aware state expansion
   if (!hasAnyCrates()) return null;
 
-  // crateAwareAStar takes W.boxPos and simulates pushing them internally
+  // crateAwareAStar simulates box pushes internally
   return crateAwareAStar(rsx, rsy, rgx, rgy, new Set(W.boxPos), pathPolicy);
+}
+
+// exact one-way-aware distance map, built backward from the goal
+function computeGoalDistanceMap(gx, gy, pathPolicy = null) {
+  const blockedSet = pathPolicy?.blockedSet ?? null;
+  const rgx = R(gx);
+  const rgy = R(gy);
+  const goalK = key(rgx, rgy);
+
+  const dist = new Map([[goalK, 0]]);
+  const queue = [[rgx, rgy]];
+
+  for (let head = 0; head < queue.length; head++) {
+    const [cx, cy] = queue[head];
+    const d = dist.get(key(cx, cy));
+
+    for (const d4 of DIRS) {
+      // predecessor tile that can legally step into the current tile
+      const px = cx - d4.dx;
+      const py = cy - d4.dy;
+      const pK = key(px, py);
+      if (dist.has(pK)) continue;
+      if (blockedSet?.has(pK) && pK !== goalK) continue;
+      if (!canStep(px, py, d4.dir, cx, cy, goalK)) continue;
+      dist.set(pK, d + 1);
+      queue.push([px, py]);
+    }
+  }
+
+  return dist;
+}
+
+// follow the exact distance map monotonically toward the goal
+export function planExactPathToTarget(sx, sy, gx, gy, pathPolicy = null) {
+  const rsx = R(sx);
+  const rsy = R(sy);
+  const startK = key(rsx, rsy);
+  const goalK = key(R(gx), R(gy));
+  if (startK === goalK) return [];
+
+  const dist = computeGoalDistanceMap(gx, gy, pathPolicy);
+  if (!dist.has(startK)) return null;
+
+  const path = [];
+  let cx = rsx;
+  let cy = rsy;
+  let guard = dist.get(startK) + 1;
+
+  while (key(cx, cy) !== goalK) {
+    if (guard-- <= 0) return null; // safety valve
+    const curD = dist.get(key(cx, cy));
+    let moved = false;
+
+    for (const d4 of DIRS) {
+      const nx = cx + d4.dx;
+      const ny = cy + d4.dy;
+      if (dist.get(key(nx, ny)) !== curD - 1) continue;
+      if (!canStep(cx, cy, d4.dir, nx, ny, goalK)) continue;
+      path.push(d4.dir);
+      cx = nx;
+      cy = ny;
+      moved = true;
+      break;
+    }
+
+    if (!moved) return null; // BFS invariant failed
+  }
+
+  return path;
 }
 
 export { coreAStar, crateAwareAStar };
