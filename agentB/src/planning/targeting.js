@@ -2,7 +2,7 @@ import { W, visitedSpawns } from "../world/state.js";
 import { manhattan, key } from "../utils/math.js";
 import { DIRS, samePos } from "../utils/directions.js";
 import { isCrateMap } from "../world/mapAnalysis.js";
-import { aStar } from "./astar.js";
+import { aStar, planExactPathToTarget } from "./astar.js";
 import {
   carriedParcels,
   carryingCount,
@@ -16,10 +16,12 @@ import {
   pickupAllowed,
   deliveryAllowed,
   deliveryMustHappenNow,
+  deliveryPreferredCarryTarget,
   missionNeedsMorePickup,
 } from "../llm/mission-policies.js";
 
 let forcedDeliveryTarget = null;
+let forcedDeliveryBlacklistWaits = 0;
 let currentSpawnPatrolTarget = null;
 let currentExploreTarget = null;
 
@@ -37,15 +39,19 @@ function tileInList(tile, list = []) {
 }
 
 function hasFinite(v) {
+  if (v === null || v === undefined || v === "") return false;
   return Number.isFinite(Number(v));
 }
 
 function hasRealMissionConstraint(policy = null) {
   if (!policy) return false;
+  // count-capped missions need deliberate(), not baseline carry heuristics
   if (policy?.wait?.mustWait) return true;
   if (policy?.wait?.trafficLight) return true;
   if (policy?.movement?.moveTo) return true;
   if (policy?.movement?.meetTarget) return true;
+  if (Number.isFinite(policy?.movement?.meetRow)) return true;
+  if (Number.isFinite(policy?.movement?.meetColumn)) return true;
   if (policy?.pickup?.enabled === false) return true;
   if (policy?.delivery?.enabled === false) return true;
   if (hasFinite(policy?.pickup?.minCarry)) return true;
@@ -63,13 +69,15 @@ function hasRealMissionConstraint(policy = null) {
   if (hasFinite(policy?.delivery?.maxExclusiveCount)) return true;
   if (hasFinite(policy?.delivery?.minParcelScore)) return true;
   if (hasFinite(policy?.delivery?.maxParcelScore)) return true;
+  if (hasFinite(policy?.delivery?.minTotalScore)) return true;
+  if (hasFinite(policy?.delivery?.maxTotalScore)) return true;
   if ((policy?.delivery?.preferredTiles ?? []).length > 0) return true;
   if ((policy?.delivery?.forbiddenTiles ?? []).length > 0) return true;
   if ((policy?.delivery?.zeroRewardTiles ?? []).length > 0) return true;
   if ((policy?.delivery?.multipliers ?? []).length > 0) return true;
-  //solve leftmost problem
   if (policy?.meta?.dropRule?.region) return true;
   if ((policy?.meta?.dropRule?.targetTiles ?? []).length > 0) return true;
+  if (policy?.meta?.handoffBonus) return true;
   if ((policy?.movement?.avoidRules ?? []).length > 0) return true;
   if ((policy?.movement?.avoidTiles ?? []).length > 0) return true;
   if ((policy?.movement?.preferTiles ?? []).length > 0) return true;
@@ -176,10 +184,32 @@ function deliveryMultiplierAt(tile, policy) {
   return 1;
 }
 
+// reward decays ~1pt per W.gameParams.decayInterval ms, a tile move takes
+// ~movementDuration ms. comparing raw tile distance to reward assumes a 1:1
+// ratio, which is way off on servers where it's more like 7 tiles/point -
+// falls back to 1:1 until we've actually measured it
+function tilesPerDecayPoint() {
+  const { decayInterval, movementDuration } = W.gameParams ?? {};
+  if (!Number.isFinite(decayInterval) || !Number.isFinite(movementDuration) || movementDuration <= 0) {
+    return 1;
+  }
+  return decayInterval / movementDuration;
+}
+
+// tilesPerDecayPoint() is a median of observed moves, doesn't capture failed
+// steps or contention - inflate it a bit so only clearly worthwhile parcels
+// pass instead of marginal ones that end up at/below break-even
+const DECAY_SAFETY_FACTOR = 1.3;
+
+function decayUnits(tiles) {
+  const ratio = tilesPerDecayPoint();
+  return ratio > 0 ? (tiles / ratio) * DECAY_SAFETY_FACTOR : tiles;
+}
+
 function turnsUntilDeliveredFrom(parcel, deliveryTile) {
   const toParcel = manhattan(W.me.x, W.me.y, parcel.x, parcel.y);
   const toDelivery = manhattan(parcel.x, parcel.y, deliveryTile.x, deliveryTile.y);
-  return toParcel + toDelivery;
+  return decayUnits(toParcel + toDelivery);
 }
 
 function projectedRewardAtDelivery(parcel, deliveryTile) {
@@ -187,6 +217,20 @@ function projectedRewardAtDelivery(parcel, deliveryTile) {
   if (!Number.isFinite(reward)) return 0;
   const eta = turnsUntilDeliveredFrom(parcel, deliveryTile);
   return reward - eta;
+}
+
+// extra distance a detour to fetch `parcel` costs vs going straight to
+// `deliveryTarget`, applied in decay to the whole carried batch, not just
+// the new parcel - a candidate can score fine on its own and still be a net
+// loss once you factor in what the detour costs everything already in the bag
+function carriedDetourCost(carried, parcel, deliveryTarget) {
+  if (!deliveryTarget || !carried || carried.length === 0) return 0;
+  const directDist = manhattan(W.me.x, W.me.y, deliveryTarget.x, deliveryTarget.y);
+  const detourDist =
+    manhattan(W.me.x, W.me.y, parcel.x, parcel.y) +
+    manhattan(parcel.x, parcel.y, deliveryTarget.x, deliveryTarget.y);
+  const extraDist = Math.max(0, detourDist - directDist);
+  return decayUnits(extraDist) * carried.length;
 }
 
 function carriedSetCanBeDeliveredAtTarget(carried, deliveryTile, policy) {
@@ -225,9 +269,8 @@ function bestDeliveryTargetMission(policy, carried) {
     if (isHardAvoidTile(z, avoidTiles, hardThreshold)) continue;
     if (!carriedSetCanBeDeliveredAtTarget(carried, z, policy)) continue;
 
-    // Do not keep selecting a mission delivery tile that the current pathfinder
-    // cannot reach. Without this guard the loop may replan the same bad target
-    // forever, especially on maps with narrow corridors or temporary blocks.
+    // don't keep selecting a delivery tile the pathfinder can't reach, or
+    // it'll replan the same bad target forever on narrow/blocked maps
     if (!samePos(W.me, z)) {
       const path = planPathToTarget(z, { avoidTiles });
       if (!Array.isArray(path) || path.length === 0) continue;
@@ -253,6 +296,10 @@ function bestDeliveryTargetMission(policy, carried) {
 
 function bestDeliveryTarget(policy = null, carried = carriedParcels()) {
   if (!hasRealMissionConstraint(policy)) return bestDeliveryTargetBaseline();
+  // a drop_rule mission has exactly one required destination, not a scored
+  // custom drop tiles override ordinary delivery-target selection
+  const dropTarget = dropRuleTarget(policy);
+  if (dropTarget) return dropTarget;
   return bestDeliveryTargetMission(policy, carried);
 }
 
@@ -262,7 +309,7 @@ export function utility(parcel, policy = null, deliveryTarget = null) {
   const distToDelivery = dz ? manhattan(parcel.x, parcel.y, dz.x, dz.y) : 0;
   const reward = policy ? effectiveParcelReward(parcel, policy) : Number(parcel.reward ?? 0);
   if (reward <= 0) return -Infinity;
-  let base = Math.pow(reward, CFG.DECAY_WEIGHT ?? 1) / (1 + distToParcel + 0.35 * distToDelivery);
+  let base = Math.pow(reward, CFG.DECAY_WEIGHT ?? 1) / (1 + decayUnits(distToParcel + 0.35 * distToDelivery));
   const threshold = Number(policy?.delivery?.minParcelScore);
   if (Number.isFinite(threshold) && dz) {
     const projected = projectedRewardAtDelivery(parcel, dz);
@@ -278,24 +325,24 @@ function parcelReachabilityScore(parcel, path, policy = null, deliveryTarget = n
   const reward = policy ? effectiveParcelReward(parcel, policy) : Number(parcel.reward ?? 0);
   if (reward <= 0) return -Infinity;
   const dz = deliveryTarget ?? nearestDeliveryFrom(parcel.x, parcel.y);
+  // require the parcel to survive the full pickup-to-delivery route
+  const distToDelivery = dz ? manhattan(parcel.x, parcel.y, dz.x, dz.y) : 0;
   const threshold = Number(policy?.delivery?.minParcelScore);
   if (Number.isFinite(threshold) && dz) {
     const projected = projectedRewardAtDelivery(parcel, dz);
     if (projected < threshold) return -Infinity;
   }
   if (!isCrateMap()) {
-    if (pathLen + 1 >= reward) return -Infinity;
+    if (decayUnits(pathLen + distToDelivery) + 1 >= reward) return -Infinity;
     return utility(parcel, policy, dz) - 0.05 * pathLen;
   }
-  const margin = reward - (pathLen + 1);
+  const margin = reward - (decayUnits(pathLen + distToDelivery) + 1);
   if (margin < -2) return -Infinity;
   return utility(parcel, policy, dz) + 0.15 * margin - 0.03 * pathLen;
 }
 
 export function maxParcelScoreValue(policy) {
-  // Only consider an explicit pickup max parcel score when deciding
-  // whether a parcel is worth picking up. Delivery-only score caps
-  // should not block pickup decisions (they apply at drop time).
+  // pickup max-score rules affect pickup; delivery caps apply at drop time
   const pickupMax = policy?.pickup?.maxParcelScore;
   return Number.isFinite(pickupMax) ? Number(pickupMax) : null;
 }
@@ -366,7 +413,7 @@ export function bestParcel(avoidTiles = [], mission = null, carriedCountArg = nu
       if (isGoalBlacklisted(p)) continue;
       if (isHardAvoidTile(p, avoidTiles)) continue;
       const mDist = manhattan(W.me.x, W.me.y, p.x, p.y);
-      if (!crateMap && mDist > Number(p.reward ?? 0)) continue;
+      if (!crateMap && decayUnits(mDist) > Number(p.reward ?? 0)) continue;
       candidates.push({ parcel: p, u: utility(p), mDist });
     }
     candidates.sort((a, b) => (b.u !== a.u ? b.u - a.u : a.mDist - b.mDist));
@@ -401,7 +448,7 @@ export function bestParcel(avoidTiles = [], mission = null, carriedCountArg = nu
     if (deliveryTarget && !parcelMeetsDeliveryValueRuleAtTarget(p, deliveryTarget, policy)) continue;
     const reward = hasScoreBasedMissionConstraint(policy) ? effectiveParcelReward(p, policy) : Number(p.reward ?? 0);
     const mDist = manhattan(W.me.x, W.me.y, p.x, p.y);
-    if (!crateMap && mDist > reward) continue;
+    if (!crateMap && decayUnits(mDist) > reward) continue;
     candidates.push({ parcel: p, u: utility(p, hasScoreBasedMissionConstraint(policy) ? policy : null, deliveryTarget), mDist });
   }
 
@@ -425,14 +472,20 @@ function bestAdjacentParcel(avoidTiles = [], mission = null, carriedCountArg = n
   const policy = normalizeMissionPolicy(mission);
   const hasMission = hasRealMissionConstraint(policy);
   if (!hasMission) {
+    const carried = carriedParcels();
+    const deliveryTarget = bestDeliveryTargetBaseline();
     let best = null, bestReward = -Infinity;
     for (const p of W.parcelList) {
       if (p.carriedBy) continue;
       if (isGoalBlacklisted(p)) continue;
       if (manhattan(W.me.x, W.me.y, p.x, p.y) !== 1) continue;
-      const reward = Number(p.reward ?? 0);
-      if (reward > bestReward) {
-        bestReward = reward;
+      // adjacent parcels still need to pay for delivery and detour cost
+      const projected = deliveryTarget ? projectedRewardAtDelivery(p, deliveryTarget) : Number(p.reward ?? 0);
+      const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+      const netGain = projected - detourCost;
+      if (netGain <= 0) continue;
+      if (netGain > bestReward) {
+        bestReward = netGain;
         best = p;
       }
     }
@@ -449,9 +502,14 @@ function bestAdjacentParcel(avoidTiles = [], mission = null, carriedCountArg = n
     if (manhattan(W.me.x, W.me.y, p.x, p.y) !== 1) continue;
     if (parcelShouldBeAvoided(p, policy, { carriedCount: effectiveCarriedCount, isOpportunistic: true, allowZeroReward: false })) continue;
     if (deliveryTarget && !parcelMeetsDeliveryValueRuleAtTarget(p, deliveryTarget, policy)) continue;
-    const reward = hasScoreBasedMissionConstraint(policy) ? effectiveParcelReward(p, policy) : Number(p.reward ?? 0);
-    if (reward > bestReward) {
-      bestReward = reward;
+    const projected = hasScoreBasedMissionConstraint(policy)
+      ? effectiveParcelReward(p, policy)
+      : (deliveryTarget ? projectedRewardAtDelivery(p, deliveryTarget) : Number(p.reward ?? 0));
+    const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+    const netGain = projected - detourCost;
+    if (netGain <= 0) continue;
+    if (netGain > bestReward) {
+      bestReward = netGain;
       best = p;
     }
   }
@@ -485,6 +543,8 @@ export function bestNearbyParcel(avoidTiles = [], carriedCountArg = 0, maxDist =
   const hasMission = hasRealMissionConstraint(policy);
 
   if (!hasMission) {
+    const carried = carriedParcels();
+    const deliveryTarget = bestDeliveryTargetBaseline();
     let best = null, bestScore = -Infinity;
     for (const p of W.parcelList) {
       if (!p || p.carriedBy) continue;
@@ -494,10 +554,16 @@ export function bestNearbyParcel(avoidTiles = [], carriedCountArg = 0, maxDist =
       if (d === 0 || d > maxDist) continue;
       const path = planPathToTarget(p, { avoidTiles });
       if (!path || path.length > maxDist) continue;
-      const reward = Number(p.reward ?? 0);
+      // account for both the trip to delivery and what the detour costs
+      // everything already carried, or it'll grab a net-loss parcel just
+      // because it was closest
+      const projected = deliveryTarget ? projectedRewardAtDelivery(p, deliveryTarget) : Number(p.reward ?? 0);
+      const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+      const netGain = projected - detourCost;
+      if (netGain <= 0) continue;
       const tilePenalty = softAvoidPenaltyAt(p, avoidTiles);
       if (tilePenalty === Infinity) continue;
-      const score = reward * 10 - path.length - tilePenalty;
+      const score = netGain * 10 - path.length - tilePenalty;
       if (score > bestScore) {
         bestScore = score;
         best = p;
@@ -522,9 +588,12 @@ export function bestNearbyParcel(avoidTiles = [], carriedCountArg = 0, maxDist =
     const path = planPathToTarget(p, { avoidTiles: missionAvoidTiles });
     if (!path || path.length > maxDist) continue;
     const projected = deliveryTarget ? projectedRewardAtDelivery(p, deliveryTarget) : Number(p.reward ?? 0);
+    const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+    const netGain = projected - detourCost;
+    if (netGain <= 0) continue;
     const tilePenalty = softAvoidPenaltyAt(p, missionAvoidTiles, hardThreshold);
     if (tilePenalty === Infinity) continue;
-    const score = projected * 10 - path.length - tilePenalty;
+    const score = netGain * 10 - path.length - tilePenalty;
     if (score > bestScore) {
       bestScore = score;
       best = p;
@@ -580,6 +649,18 @@ export function planPathToTarget(target, opts = {}) {
   if (!validGoal(target)) return null;
   const avoidRules = normalizeAvoidRules(opts.avoidTiles ?? []);
   const pathPolicy = buildPathPolicy(avoidRules, target);
+  if (Number.isFinite(opts.maxExpansions)) pathPolicy.maxExpansions = opts.maxExpansions;
+
+  if (opts.exact) {
+    // exact, one-way-aware pathing (see astar.js) instead of A*'s usual
+    // Manhattan-distance heuristic - guaranteed correct regardless of any
+    // one-way detour required, at the cost of a full BFS instead of A*'s
+    // normal quick win. reserved for rare, high-stakes queries (a
+    // coordination/handoff target), not routine per-tick delivery/pickup
+    // pathing, where that cost isn't worth paying every tick
+    return planExactPathToTarget(W.me.x, W.me.y, target.x, target.y, pathPolicy);
+  }
+
   const direct = aStar(W.me.x, W.me.y, target.x, target.y, pathPolicy);
   if (direct !== null) return direct;
   if (isCrateMap()) return null;
@@ -593,32 +674,35 @@ function updateVisibleSpawns() {
   const now = Date.now();
   for (const s of W.spawnTiles ?? []) {
     const dist = Math.max(Math.abs(W.me.x - s.x), Math.abs(W.me.y - s.y));
+    // visited means seen; pickup value is decided elsewhere
     if (dist <= VISION_RADIUS) {
-      const hasParcel = W.parcelList.some((p) => p.x === s.x && p.y === s.y);
-      if (!hasParcel) visitedSpawns.set(`${s.x},${s.y}`, now);
+      visitedSpawns.set(`${s.x},${s.y}`, now);
     }
   }
 }
 
-export function getOldestUnseenSpawn() {
+// picks one stable per-cluster target: staleness minus 2x distance, so it
+// favors clusters that are stale but still close. minUnseenSeconds is the
+// staleness floor a cluster has to clear to even be considered
+function bestSpawnClusterTarget(minUnseenSeconds) {
   if (!W.spawnAreas || W.spawnAreas.length === 0) return null;
   const now = Date.now();
   let bestTarget = null, bestClusterScore = -Infinity;
   for (const cluster of W.spawnAreas) {
-    const unseenTiles = [];
+    const candidateTiles = [];
     let maxTimeUnseen = 0;
     for (const t of cluster) {
       if (isGoalBlacklisted(t)) continue;
       const lastSeen = visitedSpawns.get(`${t.x},${t.y}`) || 0;
       const timeUnseenSeconds = (now - lastSeen) / 1000;
-      if (timeUnseenSeconds >= 15) {
-        unseenTiles.push(t);
+      if (timeUnseenSeconds >= minUnseenSeconds) {
+        candidateTiles.push(t);
         if (timeUnseenSeconds > maxTimeUnseen) maxTimeUnseen = timeUnseenSeconds;
       }
     }
-    if (unseenTiles.length === 0) continue;
+    if (candidateTiles.length === 0) continue;
     let closestUnseen = null, minDist = Infinity;
-    for (const t of unseenTiles) {
+    for (const t of candidateTiles) {
       const d = manhattan(W.me.x, W.me.y, t.x, t.y);
       if (d < minDist) {
         minDist = d;
@@ -631,18 +715,29 @@ export function getOldestUnseenSpawn() {
       bestTarget = { x: closestUnseen.x, y: closestUnseen.y };
     }
   }
+  return bestTarget;
+}
+
+export function getOldestUnseenSpawn() {
+  const bestTarget = bestSpawnClusterTarget(15);
   if (bestTarget) currentSpawnPatrolTarget = bestTarget;
   return bestTarget;
 }
 
-function nextSpawnPatrolTarget() {
+// single source of truth for "where to patrol/idle toward" - a stable,
+// cluster-scored target instead of nearest-tile, which flip-flops and makes
+// needNewPlan fire every tick. falls back to the best cluster even under the
+// 15s staleness bar so idle time is spent moving, not drifting with
+// fallbackMove(null)
+export function nextSpawnPatrolTarget() {
   updateVisibleSpawns();
+  // keep a committed patrol target until reached or blacklisted
   if (currentSpawnPatrolTarget && !isGoalBlacklisted(currentSpawnPatrolTarget)) {
-    const lastSeen = visitedSpawns.get(`${currentSpawnPatrolTarget.x},${currentSpawnPatrolTarget.y}`) || 0;
-    if (Date.now() - lastSeen > 5000) return currentSpawnPatrolTarget;
-    currentSpawnPatrolTarget = null;
+    return currentSpawnPatrolTarget;
   }
-  return getOldestUnseenSpawn();
+  const target = getOldestUnseenSpawn() ?? bestSpawnClusterTarget(0);
+  if (target) currentSpawnPatrolTarget = target;
+  return target;
 }
 
 export function completeSpawnPatrol() {
@@ -693,7 +788,6 @@ function bestCoordinationTarget(policy, avoidTiles = []) {
   return null;
 }
 
-//solve leftmost problem
 function dropRuleTiles(policy) {
   const rule = policy?.meta?.dropRule;
   const explicit = rule?.targetTiles;
@@ -717,9 +811,8 @@ function dropRuleTiles(policy) {
 }
 
 
-function dropRuleTarget(policy) {
-  // const tiles = policy?.meta?.dropRule?.targetTiles;
-  //leftmost problem
+// identity of the required drop_rule tile, independent of reachability
+export function dropRuleTarget(policy) {
   const tiles = dropRuleTiles(policy);
   if (!Array.isArray(tiles) || tiles.length === 0) return null;
   let best = null;
@@ -728,11 +821,6 @@ function dropRuleTarget(policy) {
     const x = Number(t?.x);
     const y = Number(t?.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-    //leftmost problem
-    if (!samePos(W.me, { x, y })) {
-      const path = planPathToTarget({ x, y }, { avoidTiles: policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? [] });
-      if (!Array.isArray(path) || path.length === 0) continue;
-    }
     const d = manhattan(W.me.x, W.me.y, x, y);
     if (d < bestDist) {
       bestDist = d;
@@ -742,10 +830,39 @@ function dropRuleTarget(policy) {
   return best;
 }
 
+// where to actually step toward the drop_rule target this tick: the exact
+// tile once it's known and pathable, otherwise the closest currently-known
+// walkable tile in its direction - the same "get as close as the explored
+// map allows and discover the rest along the way" fallback already used for
+// coordination targets (see bestMoveToMissionTarget/bestKnownApproachTile),
+// so an unexplored drop tile still pulls the agent toward it tick over tick
+// instead of being invisible to movement planning until it happens to be
+// seen by chance
+export function dropRuleMoveTarget(policy) {
+  const target = dropRuleTarget(policy);
+  if (!target) return null;
+  if (samePos(W.me, target)) return target;
+  const avoidTiles = policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? [];
+  const direct = planPathToTarget(target, { avoidTiles });
+  if (direct !== null) return target;
+  const avoidRules = normalizeAvoidRules(avoidTiles);
+  const pathPolicy = buildPathPolicy(avoidRules, target);
+  const approach = bestKnownApproachTile(target.x, target.y, pathPolicy);
+  return approach ? { x: approach.x, y: approach.y } : null;
+}
+
+// once handoff_bonus already has a parcel to hand off, opportunistic
+// pickup would just delay the attempt for no benefit - see the matching
+// check in deliberate()'s effectiveLimit computation
+function blockedByHandoffFocus(policy, currentCarried) {
+  return !!(policy?.meta?.handoffBonus && currentCarried >= 1);
+}
+
 export function hasOpportunisticNearbyParcel(mission = null) {
   const policy = normalizeMissionPolicy(mission);
   const currentCarried = carryingCount();
   if (currentCarried >= HARD_CARRY_LIMIT) return false;
+  if (blockedByHandoffFocus(policy, currentCarried)) return false;
   const avoidTiles = hasRealMissionConstraint(policy) ? (policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? []) : [];
   return !!bestNearbyParcel(avoidTiles, currentCarried, NEAR_PARCEL_DIST, mission);
 }
@@ -753,6 +870,7 @@ export function hasOpportunisticNearbyParcel(mission = null) {
 export function bestOpportunisticNearbyParcel(mission = null) {
   const policy = normalizeMissionPolicy(mission);
   const currentCarried = carryingCount();
+  if (blockedByHandoffFocus(policy, currentCarried)) return null;
   const avoidTiles = hasRealMissionConstraint(policy) ? (policy?.movement?.avoidRules ?? policy?.movement?.avoidTiles ?? []) : [];
   return bestNearbyParcel(avoidTiles, currentCarried, NEAR_PARCEL_DIST, mission);
 }
@@ -824,9 +942,36 @@ export async function deliberateBaseline(hint = null) {
     return { type: "WAIT", target: null };
   }
 
+  // a genuinely worthwhile parcel one tile away is worth a quick detour even
+  // mid-delivery - bestAdjacentParcelBaseline() already prices in what the
+  // detour costs the rest of the carried batch, so this never overrides a
+  // delivery that's actually more valuable. checked before the delivery
+  // branches below, which otherwise return early every time the agent is
+  // already carrying something - and unlike a parcel underfoot (handled
+  // reactively regardless of what this returns), a one-tile-away parcel is
+  // only ever picked up here, so skipping this check meant walking right
+  // past it
+  if (carriedCount < HARD_CARRY_LIMIT) {
+    const adjacentParcel = bestAdjacentParcelBaseline();
+    if (adjacentParcel) return { type: "PICKUP", target: adjacentParcel };
+  }
+
   if (carriedCount > 0 && forcedDeliveryTarget) {
-    if (validGoal(forcedDeliveryTarget) && !isGoalBlacklisted(forcedDeliveryTarget)) return { type: "DELIVER", target: forcedDeliveryTarget };
+    if (validGoal(forcedDeliveryTarget)) {
+      if (!isGoalBlacklisted(forcedDeliveryTarget)) {
+        forcedDeliveryBlacklistWaits = 0;
+        return { type: "DELIVER", target: forcedDeliveryTarget };
+      }
+      // same reasoning as the equivalent check in deliberate(): a brief
+      // (~1.5s) blacklist usually just means transient contention, not a
+      // dead end - wait it out rather than jumping to a farther tile
+      if (forcedDeliveryBlacklistWaits < 3) {
+        forcedDeliveryBlacklistWaits += 1;
+        return { type: "WAIT", target: null, source: "delivery-target-contested" };
+      }
+    }
     forcedDeliveryTarget = null;
+    forcedDeliveryBlacklistWaits = 0;
   }
 
   if (carriedCount > 0 && deliveryTarget && !isGoalBlacklisted(deliveryTarget)) {
@@ -846,9 +991,6 @@ export async function deliberateBaseline(hint = null) {
       }
     }
   }
-
-  const adjacentParcel = bestAdjacentParcelBaseline();
-  if (adjacentParcel && carriedCount < HARD_CARRY_LIMIT) return { type: "PICKUP", target: adjacentParcel };
 
   if (carriedCount === 0) {
     const nearbyParcel = bestNearbyParcelBaseline(avoidTiles, carriedCount, NEAR_PARCEL_DIST);
@@ -894,6 +1036,8 @@ export async function deliberateBaseline(hint = null) {
   }
 
   currentExploreTarget = null;
+  const idleSpawnTarget = nextSpawnPatrolTarget();
+  if (idleSpawnTarget && !isHardAvoidTile(idleSpawnTarget, avoidTiles)) return { type: "PATROL", target: idleSpawnTarget };
   return { type: "EXPLORE", target: null };
 }
 
@@ -910,9 +1054,36 @@ export async function deliberate(mission = null) {
   const isLargeMap = mapArea >= 400;
   const requestedExactCount = policy?.delivery?.exactCount;
   const cappedExactCount = Number.isFinite(requestedExactCount) ? Math.min(Number(requestedExactCount), HARD_CARRY_LIMIT) : null;
+  const requestedMaxCount = policy?.delivery?.maxCount;
+  const cappedMaxCount = Number.isFinite(requestedMaxCount) ? Math.min(Number(requestedMaxCount), HARD_CARRY_LIMIT) : null;
   const baseSoftLimit = W.strategy?.carryTarget ?? 2;
+  // "only deliver with a total score of at least N" has no count cap at all -
+  // don't let the map's unrelated carryTarget heuristic stop it from still
+  // seeking parcels toward that value just because it's holding a few
+  // low-value ones already
+  const stillNeedsTotalScore =
+    Number.isFinite(policy?.delivery?.minTotalScore) && total < policy.delivery.minTotalScore;
+  // once handoff_bonus has a parcel worth handing off, stop seeking more -
+  // sitting at exactly 1 carried parcel is what makes it handoff-eligible in
+  // the first place (executeHandoffDrop requires exactly one), so batching a
+  // 2nd/3rd on top just delays the attempt without any compensating benefit.
+  // applies from carry=0 too, not just once already carrying one - otherwise
+  // every fresh pickup cycle after a delivery still free-for-alls up to the
+  // normal soft limit before the cap ever kicks in, which is what let B run
+  // off on ordinary multi-parcel delivery loops instead of engaging with an
+  // already-active handoff mission. only a soft default, never overrides an
+  // explicit count mission
+  const handoffFocusLimit = policy?.meta?.handoffBonus ? 1 : null;
   const effectiveLimit = hasMission
-    ? (Number.isFinite(cappedExactCount) ? cappedExactCount : (isLargeMap ? Math.min(baseSoftLimit, 2) : baseSoftLimit))
+    ? (Number.isFinite(cappedExactCount)
+        ? cappedExactCount
+        : (Number.isFinite(cappedMaxCount)
+            ? cappedMaxCount
+            : (stillNeedsTotalScore
+                ? HARD_CARRY_LIMIT
+                : (Number.isFinite(handoffFocusLimit)
+                    ? handoffFocusLimit
+                    : (isLargeMap ? Math.min(baseSoftLimit, 2) : baseSoftLimit)))))
     : (isLargeMap ? Math.min(baseSoftLimit, 2) : baseSoftLimit);
   const effectivePolicy = Number.isFinite(cappedExactCount)
     ? {
@@ -936,7 +1107,12 @@ export async function deliberate(mission = null) {
     const dropTarget = dropRuleTarget(policy);
     if (dropTarget && carriedCountNow > 0) {
       if (samePos(W.me, dropTarget)) return { type: "DELIVER", target: dropTarget };
-      return { type: "MOVE", target: dropTarget };
+      const dropMoveTarget = dropRuleMoveTarget(policy);
+      if (dropMoveTarget) return { type: "MOVE", target: dropMoveTarget };
+      // nothing known yet anywhere in the target's direction (only possible
+      // very early, before any nearby tile has been explored) - fall
+      // through to the rest of the mission logic below instead of stalling
+      // on a MOVE with nowhere to go
     }
 
     const coordinationTarget = bestCoordinationTarget(policy, avoidTiles);
@@ -947,8 +1123,23 @@ export async function deliberate(mission = null) {
   }
 
   if (carriedCountNow > 0 && forcedDeliveryTarget) {
-    if (validGoal(forcedDeliveryTarget) && !isGoalBlacklisted(forcedDeliveryTarget)) return { type: "DELIVER", target: forcedDeliveryTarget };
+    if (validGoal(forcedDeliveryTarget)) {
+      if (!isGoalBlacklisted(forcedDeliveryTarget)) {
+        forcedDeliveryBlacklistWaits = 0;
+        return { type: "DELIVER", target: forcedDeliveryTarget };
+      }
+      // the committed delivery tile just got blacklisted - mainLoop.js only
+      // does this for ~1.5s (transient contention, not a dead end), and
+      // re-optimizing now can jump to a much farther tile just because it's
+      // the only other option. retry the same target once it clears, but
+      // not forever - that'd mean genuinely sustained contention
+      if (forcedDeliveryBlacklistWaits < 3) {
+        forcedDeliveryBlacklistWaits += 1;
+        return { type: "WAIT", target: null, source: "delivery-target-contested" };
+      }
+    }
     forcedDeliveryTarget = null;
+    forcedDeliveryBlacklistWaits = 0;
   }
 
   if (hasMission) {
@@ -956,9 +1147,12 @@ export async function deliberate(mission = null) {
     const missionRequiresMorePickup = missionNeedsMorePickup(effectivePolicy, { carriedCount: carriedCountNow });
     const pickupMinCarry = Number.isFinite(effectivePolicy?.pickup?.minCarry) ? Number(effectivePolicy.pickup.minCarry) : null;
     const buildingExactDeliveryCount = Number.isFinite(cappedExactCount) && carriedCountNow < cappedExactCount;
-    const requestedMaxCount = policy?.delivery?.maxCount;
-    const cappedMaxCount = Number.isFinite(requestedMaxCount) ? Math.min(Number(requestedMaxCount), HARD_CARRY_LIMIT) : null;
-    const buildingMaxDeliveryCount = !Number.isFinite(cappedExactCount) && Number.isFinite(cappedMaxCount) && carriedCountNow < cappedMaxCount;
+    const preferredCarryTarget = deliveryPreferredCarryTarget(effectivePolicy);
+    const buildingPreferredCarryTarget =
+      !missionRequiresMorePickup &&
+      Number.isFinite(preferredCarryTarget) &&
+      carriedCountNow > 0 &&
+      carriedCountNow < preferredCarryTarget;
     const buildingMinCarryTarget = Number.isFinite(pickupMinCarry) && carriedCountNow < pickupMinCarry;
 
     if (missionReadyToDeliver && carriedCountNow > 0 && deliveryTarget && !isGoalBlacklisted(deliveryTarget)) {
@@ -966,7 +1160,20 @@ export async function deliberate(mission = null) {
       return { type: "DELIVER", target: deliveryTarget };
     }
 
-    if (deliveryAllowed(effectivePolicy, { carriedCount: carriedCountNow }) && carriedCountNow > 0 && deliveryTarget && !isGoalBlacklisted(deliveryTarget)) {
+    const stillBuildingMissionCarry =
+      buildingExactDeliveryCount ||
+      buildingMinCarryTarget ||
+      missionRequiresMorePickup;
+
+    if (buildingPreferredCarryTarget && carriedCountNow < effectiveLimit) {
+      const preferredAdjacent = bestAdjacentParcel(avoidTiles, effectivePolicy, carriedCountNow);
+      if (preferredAdjacent) return { type: "PICKUP", target: preferredAdjacent };
+
+      const preferredNearby = bestNearbyParcel(avoidTiles, carriedCountNow, NEAR_PARCEL_DIST, effectivePolicy);
+      if (preferredNearby) return { type: "PICKUP", target: preferredNearby };
+    }
+
+    if (!stillBuildingMissionCarry && deliveryAllowed(effectivePolicy, { carriedCount: carriedCountNow }) && carriedCountNow > 0 && deliveryTarget && !isGoalBlacklisted(deliveryTarget)) {
       const d = manhattan(W.me.x, W.me.y, deliveryTarget.x, deliveryTarget.y);
       const hardDeliver = d <= 1 || total >= 80 || carriedCountNow === W.parcelList.length || carriedCountNow >= effectiveLimit;
       if (hardDeliver) {
@@ -984,7 +1191,7 @@ export async function deliberate(mission = null) {
       }
     }
 
-    if ((buildingExactDeliveryCount || buildingMaxDeliveryCount || buildingMinCarryTarget || missionRequiresMorePickup) && carriedCountNow < effectiveLimit) {
+    if (stillBuildingMissionCarry && carriedCountNow < effectiveLimit) {
       const exactAdjacent = bestAdjacentParcel(avoidTiles, effectivePolicy, carriedCountNow);
       if (exactAdjacent) return { type: "PICKUP", target: exactAdjacent };
 
@@ -1013,6 +1220,14 @@ export async function deliberate(mission = null) {
         return { type: "DELIVER", target: deliveryTarget };
       }
 
+      // still need more (count or total-score) but nothing pickable is
+      // visible - a null target here hits the same fallbackMove(null)
+      // drift-to-the-edge issue as the terminal EXPLORE fallback, so head
+      // toward the best spawn cluster instead
+      const idleSpawnTargetWhileBuilding = nextSpawnPatrolTarget();
+      if (idleSpawnTargetWhileBuilding && !isHardAvoidTile(idleSpawnTargetWhileBuilding, avoidTiles, hardThreshold)) {
+        return { type: "PATROL", target: idleSpawnTargetWhileBuilding };
+      }
       return countOnlyDeliveryMission(effectivePolicy)
         ? { type: "EXPLORE", target: null }
         : { type: "WAIT", target: null };
@@ -1103,5 +1318,7 @@ export async function deliberate(mission = null) {
   }
 
   currentExploreTarget = null;
+  const idleSpawnTarget = nextSpawnPatrolTarget();
+  if (idleSpawnTarget && !isHardAvoidTile(idleSpawnTarget, avoidTiles, hardThreshold)) return { type: "PATROL", target: idleSpawnTarget };
   return { type: "EXPLORE", target: null };
 }
