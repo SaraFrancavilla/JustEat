@@ -6,6 +6,15 @@ export const getToken = () => process.env.DELIVEROO_TOKEN?.trim();
 
 export const LOG_LEVEL = 1;
 
+export const TRUSTED_SENDERS = (process.env.TRUSTED_SENDERS || "ChallengeGiver,Professor")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+export function isTrustedSender(name) {
+  return TRUSTED_SENDERS.includes(String(name ?? "").trim());
+}
+
 export const CFG = {
   TICK_RATE_MS: 120,
   REPLAN_STEPS: 14,
@@ -23,7 +32,7 @@ export const CFG = {
   CRATE_PUSH_PENALTY: 2,
   PARCEL_CANDIDATE_LIMIT: 14,
   PARCEL_CANDIDATE_LIMIT_CRATE: 10,
-  REACT_NEAR_PARCEL_DIST: 3,
+  REACT_NEAR_PARCEL_DIST: 5,
   REACT_HARD_CARRY_LIMIT: 15,
 };
 
