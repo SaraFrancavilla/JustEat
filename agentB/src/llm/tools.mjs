@@ -256,20 +256,6 @@ function getAgents() {
   }
 }
 
-// Determines whether the LLM should be triggered based on current state
-
-export function shouldTriggerLLM(state) {
-  // Don't interrupt an active delivery already in progress
-  if (state.currentIntention?.type === 'DELIVER' && state.carryingCount >= 1) {
-    return false;
-  }
-  // Don't trigger if BDI just decided to pick up and is navigating there
-  if (state.currentIntention?.type === 'PICKUP' && state.carryingCount === 0) {
-    return false;
-  }
-  return true;
-}
-
 // Communication Tools
 
 let socket = null;
@@ -393,39 +379,6 @@ async function reserveParcel(input) {
     return `Successfully reserved parcel ${parcelId}`;
   } catch (error) {
     return `Error reserving parcel: ${error.message}`;
-  }
-}
-
-async function coordinatePickup(input) {
-  if (!socket) return "Error: Socket not initialized";
-  try {
-    const parsed = typeof input === "string" ? JSON.parse(input) : input;
-    const parcelId = parsed.parcelId ?? extractParcelId(parsed);
-    const teammateId = parsed.teammateId;
-    const myId = W.me?.id || 'unknown';
-
-    if (coordination.parcelReservations.has(parcelId)) {
-      const existing = coordination.parcelReservations.get(parcelId);
-      if (existing.agentId === myId) return `You already reserved ${parcelId}. Proceed with pickup.`;
-      else return `Parcel ${parcelId} reserved by teammate. Choose different parcel.`;
-    }
-
-    const reply = await socket.ask(teammateId, { action: "pickup", parcelId });
-
-    if (reply === true) {
-      coordination.parcelReservations.set(parcelId, { agentId: myId, timestamp: Date.now() });
-      coordination.pendingMessages.push({
-        type: "llm_plan",
-        plan: { intent: "GO_PICKUP", parcelId, reserved: true },
-        timestamp: Date.now()
-      });
-      return `Teammate approved. You can pickup parcel ${parcelId}.`;
-    } else {
-      coordination.parcelReservations.set(parcelId, { agentId: teammateId, timestamp: Date.now() });
-      return `Teammate will pickup ${parcelId}. Choose different parcel.`;
-    }
-  } catch (error) {
-    return `Error coordinating pickup: ${error.message}`;
   }
 }
 
