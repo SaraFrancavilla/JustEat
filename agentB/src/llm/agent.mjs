@@ -1,16 +1,8 @@
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import { TOOLS, setSocket, coordination, resetCycleState } from "./tools.mjs";
-import { COORDINATION_SYSTEM_PROMPT } from "./prompts.mjs";
-import { W } from "../world/state.js";
-import {
-  isTrustedSender,
-  pruneExpiredMissions,
-  enqueueTrustedMissionMessage,
-  processMissionQueue,
-} from "./missions.mjs";
+import { TOOLS, coordination, resetCycleState } from "./tools.mjs";
 
-dotenv.config({ path: [".env.local", ".env"] });
+dotenv.config({ path: [".env.local", ".env"], quiet: true });
 
 const baseURL = process.env.LLM_BASE_URL;
 const apiKey = process.env.LLM_API_KEY;
@@ -114,7 +106,7 @@ function parseToolInput(_action, rawInput) {
 
 async function runCoordinationCycle(
   userRequest,
-  { maxIterations = 2, systemPrompt = COORDINATION_SYSTEM_PROMPT } = {}
+  { maxIterations = 2, systemPrompt }
 ) {
   resetCycleState();
 
@@ -236,118 +228,6 @@ async function runCoordinationCycle(
     answer: "Coordination cycle timed out.",
     plan: null,
   };
-}
-
-export class LLMCoordinationAgent {
-  constructor(socket) {
-    setSocket(socket);
-    this.socket = socket;
-    console.log("[LLM] Coordination agent created for agent id:", W.me?.id);
-    this.setupMessageListener();
-  }
-
-  registerPlan(plan) {
-    coordination.pendingMessages.push({
-      type: "llm_plan",
-      plan,
-      timestamp: Date.now(),
-    });
-  }
-
-  getPendingPlan() {
-    if (coordination.pendingMessages.length === 0) return null;
-
-    const lastPlanMsg = [...coordination.pendingMessages]
-      .reverse()
-      .find((m) => m?.type === "llm_plan");
-
-    return lastPlanMsg?.plan ?? null;
-  }
-
-  acknowledgePlan() {
-    for (let i = coordination.pendingMessages.length - 1; i >= 0; i--) {
-      if (coordination.pendingMessages[i]?.type === "llm_plan") {
-        coordination.pendingMessages.splice(i, 1);
-        return;
-      }
-    }
-  }
-
-  setupMessageListener() {
-    this.socket.onMsg(async (id, name, msg, reply) => {
-      console.log(`\n[CHAT] Message from ${name} (${id}):`, msg);
-
-      pruneExpiredMissions();
-
-      const trusted = isTrustedSender(name);
-      if (trusted) {
-        console.log(`[MISSION] Trusted sender detected: "${name}"`);
-      } else {
-        console.log(`[MISSION] Non-trusted sender: "${name}"`);
-      }
-
-      if (trusted) {
-        const textMsg =
-          typeof msg === "string"
-            ? msg.trim()
-            : typeof msg === "object"
-              ? JSON.stringify(msg)
-              : String(msg ?? "").trim();
-
-        if (!textMsg) {
-          console.log("[MISSION] Empty trusted message, ignoring.");
-          return;
-        }
-
-        console.log("[MISSION] Trusted mission sender detected. Adding to queue...");
-
-        enqueueTrustedMissionMessage({
-          callModel,
-          runCoordinationCycle,
-          missionText: textMsg,
-          replyCallback: reply,
-          senderId: id,
-          socket: this.socket,
-        });
-
-        processMissionQueue().catch((error) => {
-          console.error("[MISSION] processMissionQueue failed:", error);
-        });
-
-        return;
-      }
-
-      if (typeof msg === "object" && msg.action === "pickup") {
-        const parcelId = msg.parcelId;
-        if (parcelId == null) {
-          if (reply) reply(false);
-          return;
-        }
-
-        if (coordination.parcelReservations.has(parcelId)) {
-          const reservation = coordination.parcelReservations.get(parcelId);
-          if (reservation.agentId === this.socket.id) {
-            console.log(`Replying NO: we reserved ${parcelId}`);
-            if (reply) reply(false);
-            return;
-          }
-        }
-
-        console.log(`Replying YES: teammate can take ${parcelId}`);
-        coordination.parcelReservations.set(parcelId, {
-          agentId: id,
-          timestamp: Date.now(),
-        });
-        if (reply) reply(true);
-      }
-    });
-  }
-
-  async coordinate(request = "Coordinate the next best action for the team.") {
-    const result = await runCoordinationCycle(request);
-    console.log("[LLM] Coordination result:", result);
-    return result;
-  }
 }
 
 export { runCoordinationCycle, callModel };
