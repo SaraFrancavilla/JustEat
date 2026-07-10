@@ -3,6 +3,9 @@ import { isSpawnTile } from "./helpers.js";
 
 export const W = {
   me: null,
+  // last position genuinely confirmed by the server's own "you" push - see
+  // events.js's onYou handler and reactive.js's onMissionDropTarget check
+  lastServerPos: null,
   parcels: new Map(),
   parcelList: [],
   tiles: new Map(),
@@ -34,6 +37,12 @@ export const W = {
   agents: new Map(),
   agentList: [],
 
+  // authoritative roster from the server's 'controller' event - id/name/
+  // teamId/teamName for every connected agent, independent of vision range
+  // (unlike W.agents/agentList above, which only reflect currently-sensed
+  // agents)
+  knownAgents: new Map(),
+
   mapProfile: null,
   strategy: {
     mapType: "Unknown",
@@ -41,7 +50,6 @@ export const W = {
   },
 
   gameParams: {
-    sensorRadius:     null,
     decayInterval:    null,
     movementDuration: null,
     measured:         false,
@@ -66,7 +74,7 @@ let   _lastMovePos   = null;
 
 function _tryFinalize() {
   const g = W.gameParams;
-  if (!g.measured && g.sensorRadius !== null && g.decayInterval !== null && g.movementDuration !== null) {
+  if (!g.measured && g.decayInterval !== null && g.movementDuration !== null) {
     g.measured = true;
     console.log("[PARAMS] Measured:", JSON.stringify(g));
   }
@@ -104,58 +112,6 @@ export function measureDecay(rawList) {
       }
     }
   }
-}
-
-// Measures sensor radius
-
-export function measureSensorRadius(visiblePositions) {
-  if (W.gameParams.sensorRadius !== null) return;
-  if (!W.me || W.mapWidth === null || W.mapHeight === null) return;
-
-  const mx = Math.round(W.me.x);
-  const my = Math.round(W.me.y);
-
-  // Max visible distance in each cardinal direction
-  let maxUp = 0, maxDown = 0, maxLeft = 0, maxRight = 0;
-
-  for (const pos of visiblePositions) {
-    const px = Math.round(pos.x);
-    const py = Math.round(pos.y);
-    const dx = px - mx;
-    const dy = py - my;
-
-    if (dx === 0 && dy < 0) maxUp    = Math.max(maxUp,    -dy);
-    if (dx === 0 && dy > 0) maxDown  = Math.max(maxDown,   dy);
-    if (dy === 0 && dx < 0) maxLeft  = Math.max(maxLeft,  -dx);
-    if (dy === 0 && dx > 0) maxRight = Math.max(maxRight,  dx);
-  }
-
-  // How far the map extends in each direction from agent position
-  const roomUp    = my;                    // tiles above (y=0 is top)
-  const roomDown  = W.mapHeight - 1 - my;
-  const roomLeft  = mx;
-  const roomRight = W.mapWidth  - 1 - mx;
-
-  // A direction is "map-bounded" if we see as far as the map goes
-  // (within 1 tile tolerance for walkability gaps)
-  const bounded = (seen, room) => seen === 0 || seen >= room - 1;
-
-  const allBounded =
-    bounded(maxUp, roomUp) &&
-    bounded(maxDown, roomDown) &&
-    bounded(maxLeft, roomLeft) &&
-    bounded(maxRight, roomRight);
-
-  if (allBounded) {
-    W.gameParams.sensorRadius = -1;
-  } else {
-    // Real limited sensor: take the max observed distance
-    const maxDist = Math.max(maxUp, maxDown, maxLeft, maxRight);
-    if (maxDist > 0) W.gameParams.sensorRadius = maxDist;
-    else return; // not enough data yet
-  }
-
-  _tryFinalize();
 }
 
 // Measures the real movement duration as median of observed deltas
@@ -271,6 +227,49 @@ export function updateVisibleAgents(rawAgents = []) {
     W.agents.set(agent.id, agent);
     W.agentList.push(agent);
   }
+}
+
+// keeps W.knownAgents in sync with the server's 'controller' roster events -
+// authoritative and vision-independent, unlike sensing-based W.agents
+export function updateKnownAgent(status, agent) {
+  if (!agent?.id) return;
+  if (status === "disconnected") {
+    W.knownAgents.delete(agent.id);
+    return;
+  }
+  W.knownAgents.set(agent.id, {
+    id: agent.id,
+    name: agent.name ?? null,
+    teamId: agent.teamId ?? null,
+    teamName: agent.teamName ?? null,
+  });
+}
+
+function normTeamField(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
+// true only for an agent confirmed (via the roster) to share our team.
+// matches on teamName primarily, not teamId - on this server teamId is
+// apparently per-token/session rather than a stable per-team value (two
+// agents authenticated under the same team name were observed with two
+// different teamIds), so matching on it exclusively made every teammate
+// look like a stranger. teamId is kept as a secondary, in case a
+// differently-configured server does keep it consistent. an unset team on
+// either side never matches, so a soloing agent (e.g. a trusted
+// mission-sender with no team) is correctly never a "teammate"
+export function isTeammate(id) {
+  if (!id || id === W.me?.id) return false;
+  const known = W.knownAgents.get(id);
+  if (!known) return false;
+
+  const myTeamName = normTeamField(W.me?.teamName);
+  const theirTeamName = normTeamField(known.teamName);
+  if (myTeamName && theirTeamName && myTeamName === theirTeamName) return true;
+
+  const myTeamId = normTeamField(W.me?.teamId);
+  const theirTeamId = normTeamField(known.teamId);
+  return !!myTeamId && !!theirTeamId && myTeamId === theirTeamId;
 }
 
 export function clearIntention() {
