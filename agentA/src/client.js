@@ -11,6 +11,10 @@ const client = {
   onTile: (cb) => socket.on("tile", cb),
   onMap: (cb) => socket.on("map", cb),
 
+  // server-pushed roster of every connected agent (id/name/teamId/teamName),
+  // independent of vision range - fires 'connected'/'disconnected' for each
+  onAgentConnected: (cb) => socket.on("controller", cb),
+
   onParcelsSensing: (cb) =>
     socket.on("sensing", (data) => cb(data?.parcels ?? [])),
 

@@ -5,6 +5,7 @@ import { inKnownBounds, seedLocalMap, setTile } from "../world/tiles.js";
 import { canStep, canPushCrate, isCrateTrackTile } from "../world/helpers.js";
 import { W, rememberRecentPos } from "../world/state.js";
 import { CFG } from "../config.js";
+import { nextSpawnPatrolTarget } from "../planning/targeting.js";
 
 function buildPushedBoxSet(boxSet, crateX, crateY, dir) {
   const delta = DELTA[dir];
@@ -227,7 +228,9 @@ export function rankedDirsToward(target = null) {
 export async function fallbackMove(target = null) {
   if (!canIssueAction()) return false;
 
-  const candidates = rankedDirsToward(target);
+  // use patrol as the fallback target to avoid aimless momentum drift
+  const effectiveTarget = target ?? nextSpawnPatrolTarget();
+  const candidates = rankedDirsToward(effectiveTarget);
 
   if (!W.badNeighbors) W.badNeighbors = new Map();
 

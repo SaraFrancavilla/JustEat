@@ -156,29 +156,35 @@ export async function executeActionIntent(intent, hint = null) {
     if (!effectivePicked.length) return false;
 
     if (!W.carrying) W.carrying = new Set();
-    let newlyAdded = 0;
+    const newlyAddedParcels = [];
 
     for (const p of effectivePicked) {
       const id = String(p?.id ?? "");
       if (!id) continue;
       const alreadyHad = W.carrying.has(id);
       const prev = W.parcels.get(id) ?? {};
-      W.parcels.set(id, {
+      const merged = {
         ...prev,
         id,
         x: Number(W.me?.x ?? p?.x ?? prev.x ?? 0),
         y: Number(W.me?.y ?? p?.y ?? prev.y ?? 0),
         reward: Number(p?.reward ?? prev.reward ?? 0),
         carriedBy: W.me?.id ?? prev.carriedBy ?? null,
-      });
+      };
+      W.parcels.set(id, merged);
       W.carrying.add(id);
-      if (!alreadyHad) newlyAdded++;
+      if (!alreadyHad) newlyAddedParcels.push(merged);
     }
 
     syncCaches();
     clearIntention();
-    info(`Picked up ${newlyAdded} package(s). (Now carrying ${carryingCount()})`);
-    return newlyAdded > 0;
+    if (newlyAddedParcels.length > 0) {
+      const pickedScores = newlyAddedParcels
+        .sort((a, b) => Number(b.reward ?? 0) - Number(a.reward ?? 0))
+        .map((p) => `${String(p.id)}:${Number(p.reward ?? 0)}`);
+      info(`Picked up ${newlyAddedParcels.length} package(s) [${pickedScores.join(", ")}]. (Now carrying ${carryingCount()})`);
+    }
+    return newlyAddedParcels.length > 0;
   }
 
   // ── Putdown ──────────────────────────────────────────────────────────────

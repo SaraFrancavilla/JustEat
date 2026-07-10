@@ -1,8 +1,6 @@
-import fs from "fs";
 import dotenv from "dotenv";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { startMapDebug } from "./world/state.js";
 
 dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
@@ -33,5 +31,3 @@ const { tick } = await import("./mainLoop.js");
 setInterval(tick, CFG.TICK_RATE_MS);
 
 console.log("Deliveroo Agent is ready!");
-
-// startMapDebug(8000);

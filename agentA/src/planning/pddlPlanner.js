@@ -4,14 +4,14 @@ import { fileURLToPath } from 'url';
 import { buildProblem } from './problemBuilder.js';
 import { normalizeMissionPolicy } from './mission-policies.js';
 import { W } from '../world/state.js';
-import { manhattan } from '../utils/math.js';
+import { CFG } from '../config.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ── Planning.Domains API ────────────────────────────────────────────────────
 const PLANNER_URL  = 'https://solver.planning.domains/solve';
 const PLANNER_NAME = 'ff';           // Fast-Forward, reliable for this domain
-const PLAN_TIMEOUT = 8000;           // ms — abort if planner takes too long
+const PLAN_TIMEOUT = CFG.PDDL_TIMEOUT_MS ?? 1500;
 
 // ── Cache: avoid re-planning every tick for the same mission ───────────────
 let cachedPlan       = null;   // array of action strings
@@ -45,6 +45,7 @@ export function missionNeedsPlanning(mission) {
     p.delivery.forbiddenTiles.length > 0           ||  // "never deliver to tile Y"
     p.delivery.zeroRewardTiles.length > 0          ||  // zero-reward tiles to avoid
     p.pickup.forbiddenTiles.length > 0             ||  // pickup forbidden zones
+    !!p.movement.moveTo                             ||  // explicit movement goal
     !!p.movement.meetTarget                            // rendezvous mission
   );
 }

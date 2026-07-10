@@ -2,7 +2,7 @@ import { W, visitedSpawns } from "../world/state.js";
 import { manhattan, key } from "../utils/math.js";
 import { DIRS, samePos } from "../utils/directions.js";
 import { isCrateMap } from "../world/mapAnalysis.js";
-import { aStar } from "./astar.js";
+import { aStar, planExactPathToTarget } from "./astar.js";
 import {
   carriedParcels,
   carryingCount,
@@ -13,6 +13,7 @@ import { inKnownBounds } from "../world/tiles.js";
 import { CFG } from "../config.js";
 
 let forcedDeliveryTarget = null;
+let forcedDeliveryBlacklistWaits = 0;
 let currentSpawnPatrolTarget = null;
 let currentExploreTarget = null;
 
@@ -92,12 +93,49 @@ function bestDeliveryTarget() {
   return best ?? nearestDelivery();
 }
 
+// estimate how many tile moves fit in one reward-decay point
+function tilesPerDecayPoint() {
+  const { decayInterval, movementDuration } = W.gameParams ?? {};
+  if (!Number.isFinite(decayInterval) || !Number.isFinite(movementDuration) || movementDuration <= 0) {
+    return 1;
+  }
+  return decayInterval / movementDuration;
+}
+
+// add margin for failed steps and contention
+const DECAY_SAFETY_FACTOR = 1.3;
+
+function decayUnits(tiles) {
+  const ratio = tilesPerDecayPoint();
+  return ratio > 0 ? (tiles / ratio) * DECAY_SAFETY_FACTOR : tiles;
+}
+
 export function utility(p) {
   const distToParcel = manhattan(W.me.x, W.me.y, p.x, p.y);
   const dz = nearestDeliveryFrom(p.x, p.y);
   const distToDelivery = dz ? manhattan(p.x, p.y, dz.x, dz.y) : 0;
   return Math.pow(Number(p.reward ?? 0), CFG.DECAY_WEIGHT ?? 1) /
-    (1 + distToParcel + 0.35 * distToDelivery);
+    (1 + decayUnits(distToParcel + 0.35 * distToDelivery));
+}
+
+// projected reward after pickup and delivery travel
+function projectedRewardAtDelivery(parcel, deliveryTile) {
+  const reward = Number(parcel?.reward ?? 0);
+  if (!deliveryTile) return reward;
+  const toParcel = manhattan(W.me.x, W.me.y, parcel.x, parcel.y);
+  const toDelivery = manhattan(parcel.x, parcel.y, deliveryTile.x, deliveryTile.y);
+  return reward - decayUnits(toParcel + toDelivery);
+}
+
+// detour cost applied to all currently carried parcels
+function carriedDetourCost(carried, parcel, deliveryTarget) {
+  if (!deliveryTarget || !carried || carried.length === 0) return 0;
+  const directDist = manhattan(W.me.x, W.me.y, deliveryTarget.x, deliveryTarget.y);
+  const detourDist =
+    manhattan(W.me.x, W.me.y, parcel.x, parcel.y) +
+    manhattan(parcel.x, parcel.y, deliveryTarget.x, deliveryTarget.y);
+  const extraDist = Math.max(0, detourDist - directDist);
+  return decayUnits(extraDist) * carried.length;
 }
 
 function parcelReachabilityScore(parcel, path) {
@@ -105,13 +143,16 @@ function parcelReachabilityScore(parcel, path) {
   const pathLen = path.length;
   const reward = Number(parcel.reward ?? 0);
   if (reward <= 0) return -Infinity;
+  // require the parcel to survive the full pickup-to-delivery route
+  const dz = nearestDeliveryFrom(parcel.x, parcel.y);
+  const distToDelivery = dz ? manhattan(parcel.x, parcel.y, dz.x, dz.y) : 0;
 
   if (!isCrateMap()) {
-    if (pathLen + 1 >= reward) return -Infinity;
+    if (decayUnits(pathLen + distToDelivery) + 1 >= reward) return -Infinity;
     return utility(parcel) - 0.05 * pathLen;
   }
 
-  const margin = reward - (pathLen + 1);
+  const margin = reward - (decayUnits(pathLen + distToDelivery) + 1);
   if (margin < -2) return -Infinity;
   return utility(parcel) + 0.15 * margin - 0.03 * pathLen;
 }
@@ -125,7 +166,7 @@ export function bestParcel(avoidTiles = []) {
     if (isGoalBlacklisted(p)) continue;
     if (isHardAvoidTile(p, avoidTiles)) continue;
     const mDist = manhattan(W.me.x, W.me.y, p.x, p.y);
-    if (!crateMap && mDist > Number(p.reward ?? 0)) continue;
+    if (!crateMap && decayUnits(mDist) > Number(p.reward ?? 0)) continue;
     candidates.push({ parcel: p, u: utility(p), mDist });
   }
 
@@ -151,14 +192,22 @@ export function bestParcel(avoidTiles = []) {
 }
 
 function bestAdjacentParcel() {
+  const carried = carriedParcels();
+  const deliveryTarget = bestDeliveryTarget();
   let best = null, bestReward = -Infinity;
   for (const p of W.parcelList) {
     if (p.carriedBy) continue;
     if (isGoalBlacklisted(p)) continue;
     if (manhattan(W.me.x, W.me.y, p.x, p.y) !== 1) continue;
-    const reward = Number(p.reward ?? 0);
-    if (reward > bestReward) {
-      bestReward = reward;
+    // even a parcel right next to us needs to survive the trip to delivery
+    // and not cost the rest of the carried batch more (via the detour) than
+    // it's worth
+    const projected = projectedRewardAtDelivery(p, deliveryTarget);
+    const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+    const netGain = projected - detourCost;
+    if (netGain <= 0) continue;
+    if (netGain > bestReward) {
+      bestReward = netGain;
       best = p;
     }
   }
@@ -166,6 +215,8 @@ function bestAdjacentParcel() {
 }
 
 export function bestNearbyParcel(avoidTiles = [], carriedCount = 0, maxDist = NEAR_PARCEL_DIST) {
+  const carried = carriedParcels();
+  const deliveryTarget = bestDeliveryTarget();
   let best = null, bestScore = -Infinity;
 
   for (const p of W.parcelList) {
@@ -179,11 +230,17 @@ export function bestNearbyParcel(avoidTiles = [], carriedCount = 0, maxDist = NE
     const path = planPathToTarget(p, { avoidTiles });
     if (!path || path.length > maxDist) continue;
 
-    const reward = Number(p.reward ?? 0);
+    // account for both the trip to delivery and what the detour costs
+    // everything already carried, or it'll grab a net-loss parcel just
+    // because it was closest
+    const projected = projectedRewardAtDelivery(p, deliveryTarget);
+    const detourCost = carriedDetourCost(carried, p, deliveryTarget);
+    const netGain = projected - detourCost;
+    if (netGain <= 0) continue;
     const tilePenalty = softAvoidPenaltyAt(p, avoidTiles);
     if (tilePenalty === Infinity) continue;
 
-    const score = reward * 10 - path.length - tilePenalty;
+    const score = netGain * 10 - path.length - tilePenalty;
     if (score > bestScore) {
       bestScore = score;
       best = p;
@@ -245,6 +302,12 @@ export function planPathToTarget(target, opts = {}) {
 
   const avoidRules = normalizeAvoidRules(opts.avoidTiles ?? []);
   const pathPolicy = buildPathPolicy(avoidRules, target);
+  if (Number.isFinite(opts.maxExpansions)) pathPolicy.maxExpansions = opts.maxExpansions;
+
+  if (opts.exact) {
+    // exact one-way-aware pathing for rare forced coordination targets
+    return planExactPathToTarget(W.me.x, W.me.y, target.x, target.y, pathPolicy);
+  }
 
   const direct = aStar(W.me.x, W.me.y, target.x, target.y, pathPolicy);
   if (direct !== null) return direct;
@@ -262,37 +325,38 @@ function updateVisibleSpawns() {
   const now = Date.now();
   for (const s of W.spawnTiles) {
     const dist = Math.max(Math.abs(W.me.x - s.x), Math.abs(W.me.y - s.y));
+    // visited means seen, not necessarily empty
     if (dist <= VISION_RADIUS) {
-      const hasParcel = W.parcelList.some((p) => p.x === s.x && p.y === s.y);
-      if (!hasParcel) visitedSpawns.set(`${s.x},${s.y}`, now);
+      visitedSpawns.set(`${s.x},${s.y}`, now);
     }
   }
 }
 
-export function getOldestUnseenSpawn() {
+// pick a stable spawn-cluster target using staleness and distance
+function bestSpawnClusterTarget(minUnseenSeconds) {
   if (!W.spawnAreas || W.spawnAreas.length === 0) return null;
 
   const now = Date.now();
   let bestTarget = null, bestClusterScore = -Infinity;
 
   for (const cluster of W.spawnAreas) {
-    const unseenTiles = [];
+    const candidateTiles = [];
     let maxTimeUnseen = 0;
 
     for (const t of cluster) {
       if (isGoalBlacklisted(t)) continue;
       const lastSeen = visitedSpawns.get(`${t.x},${t.y}`) || 0;
       const timeUnseenSeconds = (now - lastSeen) / 1000;
-      if (timeUnseenSeconds >= 15) {
-        unseenTiles.push(t);
+      if (timeUnseenSeconds >= minUnseenSeconds) {
+        candidateTiles.push(t);
         if (timeUnseenSeconds > maxTimeUnseen) maxTimeUnseen = timeUnseenSeconds;
       }
     }
 
-    if (unseenTiles.length === 0) continue;
+    if (candidateTiles.length === 0) continue;
 
     let closestUnseen = null, minDist = Infinity;
-    for (const t of unseenTiles) {
+    for (const t of candidateTiles) {
       const d = manhattan(W.me.x, W.me.y, t.x, t.y);
       if (d < minDist) {
         minDist = d;
@@ -307,22 +371,27 @@ export function getOldestUnseenSpawn() {
     }
   }
 
+  return bestTarget;
+}
+
+export function getOldestUnseenSpawn() {
+  const bestTarget = bestSpawnClusterTarget(15);
   if (bestTarget) currentSpawnPatrolTarget = bestTarget;
   return bestTarget;
 }
 
-function nextSpawnPatrolTarget() {
+// stable patrol target for idle exploration
+export function nextSpawnPatrolTarget() {
   updateVisibleSpawns();
 
+  // keep a patrol target until reached or blacklisted
   if (currentSpawnPatrolTarget && !isGoalBlacklisted(currentSpawnPatrolTarget)) {
-    const lastSeen = visitedSpawns.get(
-      `${currentSpawnPatrolTarget.x},${currentSpawnPatrolTarget.y}`
-    ) || 0;
-    if (Date.now() - lastSeen > 5000) return currentSpawnPatrolTarget;
-    currentSpawnPatrolTarget = null;
+    return currentSpawnPatrolTarget;
   }
 
-  return getOldestUnseenSpawn();
+  const target = getOldestUnseenSpawn() ?? bestSpawnClusterTarget(0);
+  if (target) currentSpawnPatrolTarget = target;
+  return target;
 }
 
 export function completeSpawnPatrol() {
@@ -372,11 +441,28 @@ export async function deliberate(hint = null) {
     return { type: "WAIT", target: null };
   }
 
+  // adjacent parcels are allowed only when their detour cost still pays off
+  if (carriedCount < HARD_CARRY_LIMIT) {
+    const adjacentParcel = bestAdjacentParcel();
+    if (adjacentParcel) {
+      return { type: "PICKUP", target: adjacentParcel };
+    }
+  }
+
   if (carriedCount > 0 && forcedDeliveryTarget) {
-    if (validGoal(forcedDeliveryTarget) && !isGoalBlacklisted(forcedDeliveryTarget)) {
-      return { type: "DELIVER", target: forcedDeliveryTarget };
+    if (validGoal(forcedDeliveryTarget)) {
+      if (!isGoalBlacklisted(forcedDeliveryTarget)) {
+        forcedDeliveryBlacklistWaits = 0;
+        return { type: "DELIVER", target: forcedDeliveryTarget };
+      }
+      // short blacklists usually mean contention, so retry briefly
+      if (forcedDeliveryBlacklistWaits < 3) {
+        forcedDeliveryBlacklistWaits += 1;
+        return { type: "WAIT", target: null, source: "delivery-target-contested" };
+      }
     }
     forcedDeliveryTarget = null;
+    forcedDeliveryBlacklistWaits = 0;
   }
 
   if (carriedCount > 0 && deliveryTarget && !isGoalBlacklisted(deliveryTarget)) {
@@ -403,11 +489,6 @@ export async function deliberate(hint = null) {
         return { type: "DELIVER", target: deliveryTarget };
       }
     }
-  }
-
-  const adjacentParcel = bestAdjacentParcel();
-  if (adjacentParcel && carriedCount < HARD_CARRY_LIMIT) {
-    return { type: "PICKUP", target: adjacentParcel };
   }
 
   if (carriedCount === 0) {
@@ -465,5 +546,7 @@ export async function deliberate(hint = null) {
   }
 
   currentExploreTarget = null;
+  const idleSpawnTarget = nextSpawnPatrolTarget();
+  if (idleSpawnTarget && !isHardAvoidTile(idleSpawnTarget, avoidTiles)) return { type: "PATROL", target: idleSpawnTarget };
   return { type: "EXPLORE", target: null };
 }

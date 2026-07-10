@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "explorer.exe \"https://deliveroojs.onrender.com/\" >/dev/null 2>&1 || true && node src/index.js",
-    "test": "explorer.exe \"http://localhost:8080/\" >/dev/null 2>&1 || true && cross-env TEST_LOCAL=true node src/index.js"
+    "test": "explorer.exe \"http://localhost:8080/\" >/dev/null 2>&1 || true && node -e \"process.env.TEST_LOCAL='true'; import('./src/index.js')\""
   },
   "author": "",
   "license": "ISC",

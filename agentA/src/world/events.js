@@ -1,5 +1,5 @@
 import client from "../client.js";
-import { W, syncCaches, measureDecay, measureSensorRadius, measureMovementDuration } from "./state.js";
+import { W, syncCaches, measureDecay, measureMovementDuration, updateKnownAgent } from "./state.js";
 import { setTile, normalizeTileArgs } from "./tiles.js";
 import { key, R } from "../utils/math.js";
 import { debug } from "../config.js";
@@ -75,7 +75,6 @@ client.onMap((width, height, tiles) => {
 client.onParcelsSensing((list) => {
   W.parcels.clear();
   measureDecay(list);
-  measureSensorRadius(list.map(p => ({ x: Number(p.x), y: Number(p.y) })));
 
   for (const raw of list) {
     const p = raw?.parcel ?? raw;
@@ -99,9 +98,12 @@ client.onParcelsSensing((list) => {
   }
 });
 
+client.onAgentConnected((status, agent) => {
+  updateKnownAgent(status, agent);
+});
+
 client.onAgentsSensing((list) => {
   W.agentPos.clear();
-  measureSensorRadius(list.map(a => ({ x: Number(a.x), y: Number(a.y) })));
 
   for (const agent of list) {
     if (!agent?.id || !Number.isFinite(agent.x) || !Number.isFinite(agent.y)) {

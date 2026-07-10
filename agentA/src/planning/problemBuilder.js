@@ -28,6 +28,7 @@ export function buildProblem(mission = null) {
   const me      = W.me;
   const meId    = 'agent1';
   const myPos   = { x: Math.round(me.x), y: Math.round(me.y) };
+  const movementTarget = policy.movement.moveTo ?? policy.movement.meetTarget ?? null;
 
   // ── 1. Collect candidate tiles ──────────────────────────────────────────
   const allTiles   = [...(W.tiles?.values?.() ?? [])].filter(t => t.walkable !== false);
@@ -42,6 +43,12 @@ export function buildProblem(mission = null) {
   const tileSet = new Map();
   for (const t of [...nearTiles, ...delivTiles]) {
     tileSet.set(key(t.x, t.y), { x: t.x, y: t.y });
+  }
+  if (movementTarget && W.tiles?.has?.(key(movementTarget.x, movementTarget.y))) {
+    tileSet.set(key(movementTarget.x, movementTarget.y), {
+      x: Number(movementTarget.x),
+      y: Number(movementTarget.y),
+    });
   }
   const tiles = [...tileSet.values()];
 
@@ -90,7 +97,9 @@ export function buildProblem(mission = null) {
   const exactCarry = policy.pickup.exactCarry;
   let goalLines = [];
 
-  if (Number.isFinite(exactCarry)) {
+  if (movementTarget) {
+    goalLines.push(`(at ${meId} ${tileId(movementTarget.x, movementTarget.y)})`);
+  } else if (Number.isFinite(exactCarry)) {
     // Goal: hold exactly N parcels and be on a delivery tile
     const targetParcels = freeParcels.slice(0, exactCarry);
     for (const p of targetParcels) {

@@ -7,6 +7,8 @@ export const getToken = () => process.env.DELIVEROO_TOKEN?.trim();
 export const LOG_LEVEL = 1;
 
 export const CFG = {
+  USE_PDDL: process.env.USE_PDDL === "true",
+  PDDL_TIMEOUT_MS: Number(process.env.PDDL_TIMEOUT_MS ?? 1500),
   TICK_RATE_MS: 120,
   REPLAN_STEPS: 14,
   ASTAR_MAX_EXPANSIONS: 4000,
@@ -23,7 +25,7 @@ export const CFG = {
   CRATE_PUSH_PENALTY: 2,
   PARCEL_CANDIDATE_LIMIT: 14,
   PARCEL_CANDIDATE_LIMIT_CRATE: 10,
-  REACT_NEAR_PARCEL_DIST: 3,
+  REACT_NEAR_PARCEL_DIST: 5,
   REACT_HARD_CARRY_LIMIT: 15,
 };
 

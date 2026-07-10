@@ -1,9 +1,9 @@
-import { info } from "../config.js";
+import { W } from "../world/state.js";
+import { samePos } from "../utils/directions.js";
 import {
   carryingCount,
   parcelsHere,
   onDeliveryTile,
-  carriedParcels,
 } from "../world/helpers.js";
 import {
   canIssueAction,
@@ -22,22 +22,27 @@ export function proposeReactiveAction(mission = null) {
   const hereParcels = parcelsHere();
   const onDelTile = onDeliveryTile();
 
-  // If a coordination hint is active (moveTo / meetRadius / WAIT mode),
-  // suppress opportunistic/reactive pickups so the agent moves to rendezvous.
+  // a coordination hint (moveTo/meetRadius/WAIT) suppresses opportunistic
+  // pickups so the agent moves to rendezvous. exception: a collect_parcel
+  // handoff is itself a directed pickup, but only once actually at the
+  // handoff tile - without the samePos check it fired on every tile
+  // crossed en route
   if (mission && (mission.mode === "WAIT" || mission.moveTo || Number.isFinite(mission.meetRadius))) {
     if (carriedCount > 0 && onDelTile && canDeliverNow(mission, carriedCount)) {
       return putdownAction();
     }
+    if (
+      mission.llmType === "PICKUP" &&
+      mission.moveTo &&
+      samePos(W.me, mission.moveTo) &&
+      carriedCount < REACTIVE_HARD_PICKUP_LIMIT &&
+      canPickupNow(mission, carriedCount) &&
+      hereParcels.length > 0
+    ) {
+      return pickupAction();
+    }
     return null;
   }
-
-  // info(
-  //   "[DEBUG reactive]",
-  //   "count", carriedCount,
-  //   "knownCarried", carriedParcels().length,
-  //   "parcelsHere", hereParcels.map((p) => `${p.id}@${p.x},${p.y}`).join(","),
-  //   "onDelivery", onDelTile
-  // );
 
   if (carriedCount > 0 && onDelTile && canDeliverNow(mission, carriedCount)) {
     return putdownAction();
