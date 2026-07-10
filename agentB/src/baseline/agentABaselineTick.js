@@ -134,8 +134,6 @@ export async function tickAgentABaseline(hint = null) {
   maybeStartStrategyAnalysis();
   updateSpatialMemory();
 
-  // const hint = null;
-
   if (hint?.mode === "WAIT") {
     if (intention.type !== "WAIT") {
       clearIntention();
@@ -144,7 +142,7 @@ export async function tickAgentABaseline(hint = null) {
       intention.steps = 0;
       intention.path = [];
     }
-    await executeActionIntent(waitAction("hint_wait"), hint);
+    await executeBaselineActionIntent(waitAction("hint_wait"), hint);
     return;
   }
 
@@ -176,6 +174,21 @@ export async function tickAgentABaseline(hint = null) {
   if (shouldPreferOpportunisticPickup(hint, next)) {
     const pickupPlan = opportunisticPickupPlan(hint);
     if (pickupPlan) next = pickupPlan;
+  }
+
+  // deliberateBaseline() can itself decide to WAIT (e.g. a committed
+  // delivery target just got briefly blacklisted - see forcedDeliveryTarget
+  // there). a WAIT with a null target would otherwise fall through to
+  // fallbackMove(next.target), which has no destination and just wanders
+  // off - intercept it the same way hint.mode === "WAIT" is above
+  if (next.type === "WAIT") {
+    if (intention.type !== "WAIT") clearIntention();
+    intention.type = "WAIT";
+    intention.target = null;
+    intention.steps = 0;
+    intention.path = [];
+    await executeBaselineActionIntent(waitAction(next.source ?? "deliberate_wait"), hint);
+    return;
   }
 
   const needNewPlan =
@@ -229,6 +242,12 @@ export async function tickAgentABaseline(hint = null) {
     const dir = intention.path.shift();
     if (!(await tryMoveDir(dir))) {
       const { targetFails } = registerTargetFailure(intention.target);
+      if (intention.type === "DELIVER" && intention.target) {
+        if (targetFails >= 3) blacklistGoal(intention.target);
+        clearIntention();
+        await tryReactiveFollowup(hint);
+        return;
+      }
       if (shouldRelaxFailureHandling()) {
         clearIntention();
       } else if (intention.target && targetFails >= 3) {
